@@ -24,13 +24,19 @@ class ProbeResult:
     bypassed: bool = False
 
 
-class ProbeStep(Protocol):
-    """One representative forward/backward/optimizer probe operation."""
+class LocalProbeStep(Protocol):
+    """A collective-free probe step executed before ``runtime.prepare``.
 
-    model: torch.nn.Module
+    ``local_model`` must be the unwrapped, unprepared module. The callable
+    receives that module rather than the runtime so it can use ordinary local
+    forward, ``Tensor.backward``, and optimizer operations without entering
+    Accelerate accumulation or DDP synchronization.
+    """
+
+    local_model: torch.nn.Module
     optimizer: torch.optim.Optimizer
 
-    def __call__(self, runtime: TrainingRuntime, sample: Any) -> None: ...
+    def __call__(self, local_model: torch.nn.Module, sample: Any) -> None: ...
 
 
 @dataclass
@@ -51,11 +57,17 @@ def probe_microbatch(
     runtime: TrainingRuntime,
     candidates: Iterable[int],
     sample_factory: Callable[[int], Any],
-    step_fn: ProbeStep,
+    step_fn: LocalProbeStep,
     *,
     explicit_microbatch: int | None = None,
 ) -> ProbeResult:
-    """Select the largest candidate that completes on every rank without retaining probe state."""
+    """Select the largest collective-free local candidate that succeeds on every rank.
+
+    This function must run before ``runtime.prepare``. Each candidate performs
+    only local model/optimizer work, restores all probe effects, and then uses
+    exactly one status collective. A wrapped model is rejected so DDP backward
+    synchronization cannot race a peer rank's OOM status path.
+    """
     if explicit_microbatch is not None:
         _validate_candidate(explicit_microbatch, "explicit_microbatch")
         return ProbeResult(explicit_microbatch, all_rank_success=True, attempted=(), bypassed=True)
@@ -66,11 +78,13 @@ def probe_microbatch(
     for candidate in ordered:
         _validate_candidate(candidate, "microbatch candidate")
 
-    model = getattr(step_fn, "model", None)
+    model = getattr(step_fn, "local_model", None)
     optimizer = getattr(step_fn, "optimizer", None)
     if not isinstance(model, torch.nn.Module) or not isinstance(optimizer, torch.optim.Optimizer):
-        raise TypeError("step_fn must expose the probe model and optimizer")
+        raise TypeError("step_fn must expose an unwrapped local_model and optimizer")
     target = runtime.unwrap(model)
+    if target is not model:
+        raise ProbeError("probe local_model must be unwrapped and used before runtime.prepare")
     snapshot = _snapshot(target, optimizer, runtime.device)
 
     largest_success: int | None = None
@@ -80,7 +94,7 @@ def probe_microbatch(
         local_status = _SUCCESS
         terminal_error: Exception | None = None
         try:
-            step_fn(runtime, sample_factory(candidate))
+            step_fn(target, sample_factory(candidate))
         except torch.cuda.OutOfMemoryError:
             local_status = _OOM
         except Exception as error:
@@ -90,11 +104,11 @@ def probe_microbatch(
             _restore(target, optimizer, snapshot, runtime.device)
 
         statuses = runtime.gather(torch.tensor([local_status], dtype=torch.int8, device=runtime.device)).reshape(-1)
-        runtime.barrier()
         if bool((statuses == _TERMINAL).any().item()):
+            error = ProbeError(f"non-OOM microbatch probe failure on one or more ranks for candidate {candidate}")
             if terminal_error is not None:
-                raise terminal_error
-            raise ProbeError("a non-OOM microbatch probe failure occurred on another rank")
+                raise error from terminal_error
+            raise error
         if bool((statuses == _SUCCESS).all().item()):
             largest_success = candidate
         elif local_status == _OOM and runtime.device.type == "cuda":

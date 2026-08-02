@@ -52,33 +52,38 @@ class _TinyLoRAModel(torch.nn.Module):
         return inputs @ weight.transpose(0, 1)
 
 
-class _SyntheticProbeStep:
-    def __init__(self, runtime: AccelerateRuntime, model, optimizer, accumulation: int):
-        self.runtime = runtime
-        self.model = model
+class _SyntheticLocalProbeStep:
+    def __init__(
+        self,
+        local_model: torch.nn.Module,
+        optimizer: torch.optim.Optimizer,
+        *,
+        rank: int,
+        fault_rank: int | None = None,
+        fault_candidate: int | None = None,
+    ):
+        self.local_model = local_model
         self.optimizer = optimizer
-        self.accumulation = accumulation
-        self.synchronized = []
+        self.rank = rank
+        self.fault_rank = fault_rank
+        self.fault_candidate = fault_candidate
+        self.injected_oom = False
 
-    def __call__(self, runtime: AccelerateRuntime, sample: tuple[torch.Tensor, torch.Tensor]) -> None:
+    def __call__(self, local_model: torch.nn.Module, sample: tuple[torch.Tensor, torch.Tensor]) -> None:
         inputs, targets = sample
-        for _ in range(self.accumulation):
-            with runtime.accumulate(self.model):
-                torch.rand(1, device=runtime.device)
-                loss = torch.nn.functional.mse_loss(self.model(inputs), targets)
-                runtime.backward(loss)
-                self.synchronized.append(runtime.sync_gradients)
-                if runtime.sync_gradients:
-                    runtime.clip_grad_norm_(self.model.parameters(), 10.0)
-                self.optimizer.step()
-                self.optimizer.zero_grad()
-        if not self.synchronized[-1]:
-            raise AssertionError("probe candidate did not reach a synchronized accumulation boundary")
+        torch.rand(1, device=inputs.device)
+        loss = torch.nn.functional.mse_loss(local_model(inputs), targets)
+        loss.backward()
+        candidate = int(inputs.shape[0])
+        if self.rank == self.fault_rank and candidate == self.fault_candidate:
+            self.injected_oom = True
+            raise torch.cuda.OutOfMemoryError(f"injected rank-local OOM for candidate {candidate}")
+        self.optimizer.step()
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=("train-checkpoint",), required=True)
+    parser.add_argument("--mode", choices=("train-checkpoint", "probe-rank-fault"), required=True)
     parser.add_argument("--runtime", choices=("accelerate",), default="accelerate")
     return parser.parse_args()
 
@@ -165,16 +170,14 @@ def _run_train_checkpoint() -> None:
     torch.manual_seed(3407)
     torch.cuda.manual_seed(3407)
 
-    model = _TinyLoRAModel()
+    model = _TinyLoRAModel().to(runtime.device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=_LEARNING_RATE, weight_decay=0.0)
-    model, optimizer = runtime.prepare(model, optimizer)
-    target = runtime.unwrap(model)
-    initial_state = {name: value.detach().clone() for name, value in target.state_dict().items()}
+    initial_state = {name: value.detach().clone() for name, value in model.state_dict().items()}
     initial_optimizer = optimizer.state_dict()
     initial_cpu_rng = torch.get_rng_state().clone()
     initial_cuda_rng = torch.cuda.get_rng_state(runtime.device).clone()
 
-    probe_step = _SyntheticProbeStep(runtime, model, optimizer, _ACCUMULATION)
+    probe_step = _SyntheticLocalProbeStep(model, optimizer, rank=runtime.rank)
 
     def probe_sample(candidate: int) -> tuple[torch.Tensor, torch.Tensor]:
         inputs = torch.full((candidate, 1), 0.25, dtype=torch.float32, device=runtime.device)
@@ -189,9 +192,11 @@ def _run_train_checkpoint() -> None:
     if not torch.equal(torch.cuda.get_rng_state(runtime.device), initial_cuda_rng):
         raise AssertionError("probe did not restore CUDA RNG")
     for name, expected in initial_state.items():
-        if not torch.equal(target.state_dict()[name], expected):
+        if not torch.equal(model.state_dict()[name], expected):
             raise AssertionError(f"probe did not restore model state {name}")
 
+    model, optimizer = runtime.prepare(model, optimizer)
+    target = runtime.unwrap(model)
     total_samples = runtime.world_size * _MICROBATCH * _ACCUMULATION
     dataset = _SyntheticSamples(total_samples)
     loader = DataLoader(dataset, batch_size=_MICROBATCH, shuffle=False, drop_last=True)
@@ -293,10 +298,107 @@ def _run_train_checkpoint() -> None:
         print("SMOKE_RESULT " + json.dumps(summary, sort_keys=True), flush=True)
 
 
+def _run_probe_rank_fault() -> None:
+    if not torch.cuda.is_available():
+        raise RuntimeError("the required rank-fault smoke must run on CUDA")
+    runtime = AccelerateRuntime.create(SimpleNamespace(accumulation=_ACCUMULATION))
+    if runtime.world_size < 2:
+        raise RuntimeError("probe-rank-fault requires multiple processes")
+    torch.manual_seed(811)
+    torch.cuda.manual_seed(811)
+
+    model = _TinyLoRAModel().to(runtime.device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=_LEARNING_RATE, weight_decay=0.0)
+    initial_state = {name: value.detach().clone() for name, value in model.state_dict().items()}
+    initial_optimizer = optimizer.state_dict()
+    fault_rank = runtime.world_size - 1
+    step = _SyntheticLocalProbeStep(
+        model,
+        optimizer,
+        rank=runtime.rank,
+        fault_rank=fault_rank,
+        fault_candidate=2,
+    )
+
+    def probe_sample(candidate: int) -> tuple[torch.Tensor, torch.Tensor]:
+        inputs = torch.full((candidate, 1), 0.25, dtype=torch.float32, device=runtime.device)
+        targets = torch.full((candidate, 1), 0.0625, dtype=torch.float32, device=runtime.device)
+        return inputs, targets
+
+    probe = probe_microbatch(runtime, [1, 2], probe_sample, step)
+    if probe.microbatch != 1:
+        raise AssertionError(f"rank-local OOM should select previous candidate 1, got {probe.microbatch}")
+    if optimizer.state_dict() != initial_optimizer:
+        raise AssertionError("rank-fault probe retained optimizer state")
+    for name, expected in initial_state.items():
+        if not torch.equal(model.state_dict()[name], expected):
+            raise AssertionError(f"rank-fault probe retained model state {name}")
+    injected = runtime.gather(torch.tensor([int(step.injected_oom)], dtype=torch.int8, device=runtime.device)).reshape(
+        -1
+    )
+    if injected.tolist() != [0] * fault_rank + [1]:
+        raise AssertionError(f"OOM injection did not occur on exactly rank {fault_rank}: {injected.tolist()}")
+
+    model, optimizer = runtime.prepare(model, optimizer)
+    target = runtime.unwrap(model)
+    total_samples = runtime.world_size * probe.microbatch * _ACCUMULATION
+    loader = DataLoader(_SyntheticSamples(total_samples), batch_size=probe.microbatch, shuffle=False, drop_last=True)
+    loader = runtime.prepare(loader)
+    sync_pattern: list[bool] = []
+    for batch in loader:
+        with runtime.accumulate(model):
+            loss = torch.nn.functional.mse_loss(model(batch["input"]), batch["target"])
+            runtime.backward(loss)
+            sync_pattern.append(runtime.sync_gradients)
+            if runtime.sync_gradients:
+                runtime.clip_grad_norm_(model.parameters(), 10.0)
+            optimizer.step()
+            optimizer.zero_grad()
+
+    if sync_pattern != [False, True]:
+        raise AssertionError(f"probe advanced accumulation cursor on rank {runtime.rank}: {sync_pattern}")
+    gathered_patterns = runtime.gather(torch.tensor(sync_pattern, dtype=torch.int8, device=runtime.device)).reshape(
+        runtime.world_size, -1
+    )
+    if not torch.equal(gathered_patterns, torch.tensor([[0, 1]] * runtime.world_size, device=runtime.device)):
+        raise AssertionError(f"post-probe accumulation differs across ranks: {gathered_patterns.tolist()}")
+    if _optimizer_step(optimizer) != 1:
+        raise AssertionError("post-probe normal training did not take exactly one optimizer step")
+
+    evidence = {
+        "rank": runtime.rank,
+        "world_size": runtime.world_size,
+        "fault_rank": fault_rank,
+        "injected_oom": step.injected_oom,
+        "selected_microbatch": probe.microbatch,
+        "sync_pattern": sync_pattern,
+        "optimizer_step": _optimizer_step(optimizer),
+        "lora_values": _lora_values(target).tolist(),
+    }
+    print("RANK_FAULT_EVIDENCE " + json.dumps(evidence, sort_keys=True), flush=True)
+    if runtime.rank == 0:
+        print(
+            "RANK_FAULT_RESULT "
+            + json.dumps(
+                {
+                    "status": "PASS",
+                    "world_size": runtime.world_size,
+                    "fault_rank": fault_rank,
+                    "selected_microbatch": probe.microbatch,
+                    "sync_pattern": sync_pattern,
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+
+
 def main() -> None:
     args = _parse_args()
     if args.mode == "train-checkpoint":
         _run_train_checkpoint()
+    elif args.mode == "probe-rank-fault":
+        _run_probe_rank_fault()
 
 
 if __name__ == "__main__":
