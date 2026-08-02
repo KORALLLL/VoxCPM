@@ -40,3 +40,13 @@ Implemented the Task 12 two-stage trainer and the required Task 9 recovery-check
 
 - Distributed failure safety is intentionally conservative: exceptions inside a broken DDP backward collective require launcher/process restart because no safe collective checkpoint can be guaranteed.
 - Full-scale performance of per-phase status gathers and real VoxCPM2 forward memory remains for the already-planned GPU smoke/preflight tasks; this task deliberately did not launch them.
+
+## Fix Round 1
+
+- Scheduler ownership is now explicit: `Accelerator(step_scheduler_with_optimizer=False)` leaves the trainer's one `scheduler.step()` per real global optimizer update as the sole schedule owner. The trainer still performs one joint `prepare(model, optimizer, loader, scheduler)`.
+- Recovery safety uses a separate in-flight accumulation cursor. A loader/forward/optimizer failure after an unsynchronized backward requires process restart; recovery is allowed only at cursor zero after a non-skipped synchronized optimizer, scheduler, and progress update. Stop decisions remain latched across skipped attempts.
+- Same-stage recovery at an exact validation boundary verifies the durable marker. Missing, malformed, or identity-mismatched markers rerun evaluator completion and are atomically replaced before another update; matching markers suppress duplicate evaluation.
+- Accelerate state save, checkpoint setup/state/finalize/visibility, and rank-zero boundary marker publication now gather a single success outcome before any rank raises. Broken outcome collectives produce restart-required errors and never trigger another recovery collective.
+- The mandated curriculum is enforced before model construction: stage 1 is exactly 2 epochs at `1e-4`; stage 2 is exactly 3 epochs at `5e-5`, preserving 16 and 24 validations respectively.
+- Targeted RED/GREEN coverage includes accumulation>1 mid-group loader/forward faults, skipped-step signal latching, exact-boundary recovery before/after/mismatched marker, same-epoch replay seeding and next-epoch increment, curriculum drift, rank-local/peer state-save, finalize and marker failures, and broken collectives. Focused integration passes `107` tests; the full CPU suite passes `278` tests with 5 warnings.
+- A final real eight-process Accelerate 1.14 CPU/Gloo regression passed on the formatted tree. All ranks reported one joint prepare, 4 synchronized attempts including one synthetic skipped update, 3 real optimizer steps, exactly 3 scheduler steps (not 24), identical sample prefixes when replaying sampler epoch 17, and a changed order after advancing once to epoch 18.

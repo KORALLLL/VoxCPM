@@ -71,8 +71,14 @@ class AccelerateRuntime:
         )
         return cls(
             accelerator_cls(
+                cpu=_config_cpu(config),
                 mixed_precision="bf16",
                 gradient_accumulation_steps=accumulation,
+                # The trainer owns the single scheduler.step() that follows
+                # each real global optimizer update.  Accelerate's default
+                # wrapper otherwise repeats that call once per process when
+                # split_batches=False.
+                step_scheduler_with_optimizer=False,
                 dataloader_config=dataloader_config,
                 kwargs_handlers=[ddp_kwargs],
             )
@@ -119,7 +125,22 @@ class AccelerateRuntime:
         return self.accelerator.unwrap_model(model)
 
     def save(self, output_dir: str | PathLike[str]) -> None:
-        self.accelerator.save_state(str(output_dir))
+        local_error: BaseException | None = None
+        try:
+            self.accelerator.save_state(str(output_dir))
+        except BaseException as error:
+            local_error = error
+        status = torch.tensor([0 if local_error is not None else 1], dtype=torch.int8, device=self.device)
+        try:
+            gathered = self.accelerator.gather_for_metrics(status).reshape(-1)
+        except BaseException as collective_error:
+            raise RuntimeError("state-save outcome collective failed; process restart required") from (
+                local_error or collective_error
+            )
+        if not bool((gathered == 1).all().item()):
+            if local_error is not None:
+                raise local_error
+            raise RuntimeError("peer rank failed during state save")
         self.accelerator.wait_for_everyone()
 
     def load(self, input_dir: str | PathLike[str]) -> None:
@@ -134,6 +155,13 @@ def _config_accumulation(config: Any) -> int:
     if isinstance(accumulation, bool) or not isinstance(accumulation, int) or accumulation <= 0:
         raise ValueError("runtime accumulation must be a positive integer")
     return accumulation
+
+
+def _config_cpu(config: Any) -> bool:
+    value = config.get("cpu", False) if isinstance(config, Mapping) else getattr(config, "cpu", False)
+    if not isinstance(value, bool):
+        raise ValueError("runtime cpu must be a boolean")
+    return value
 
 
 def _reject_distributed_sampler(loader: DataLoader[Any]) -> None:

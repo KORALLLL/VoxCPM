@@ -16,7 +16,7 @@ from torch.optim import AdamW
 from voxcpm.training.data import BatchProcessor
 
 from .artifacts import atomic_json, sha256_file
-from .checkpoint import CheckpointManager
+from .checkpoint import CheckpointCollectiveError, CheckpointManager
 from .dataset import IndexedBalalaikaDataset, build_unsharded_dataloader
 from .schedule import EpochGeometry, TrainingProgress
 
@@ -226,6 +226,7 @@ class BalalaikaTrainer:
         self.progress: TrainingProgress | None = None
         self._stop_signal: int | None = None
         self._safe_for_recovery = True
+        self._accumulation_cursor = 0
         self._coordinated_recovery = True
         self._pending_boundary_checkpoint: Path | None = None
 
@@ -239,6 +240,7 @@ class BalalaikaTrainer:
         stage_config = getattr(self.config, stage_name, None)
         if stage_config is None:
             raise TrainerConfigurationError(f"configuration does not define {stage_name}")
+        self._validate_curriculum()
         if stage == 1:
             self._verify_stage1_approval()
 
@@ -346,7 +348,10 @@ class BalalaikaTrainer:
             if checkpoint_kind not in {"boundary", "recovery"}:
                 raise TrainerConfigurationError("resume checkpoint has no supported checkpoint_kind")
             self.last_durable_checkpoint = self.resume_checkpoint
-            if checkpoint_kind == "boundary":
+            at_validation_boundary = self._is_exact_validation_boundary(progress, geometry)
+            if checkpoint_kind == "boundary" and not at_validation_boundary:
+                raise TrainerConfigurationError("boundary checkpoint progress is not at an exact validation boundary")
+            if at_validation_boundary:
                 self._finish_boundary(
                     model,
                     audio_vae,
@@ -397,10 +402,8 @@ class BalalaikaTrainer:
                     progress.start_next_epoch()
                     continue
 
-                _set_loader_epoch(loader, progress.sampler_epoch)
                 epoch_iterator = self._epoch_iterator(loader, progress, geometry)
                 while progress.optimizer_step < epoch_end_step:
-                    self._safe_for_recovery = progress.microstep % geometry.accumulation == 0
                     self._coordinated_recovery = True
                     batch = self._next_coordinated_batch(epoch_iterator)
                     with self.runtime.accumulate(model):
@@ -420,8 +423,17 @@ class BalalaikaTrainer:
                         self._safe_for_recovery = False
                         self._coordinated_recovery = False
                         self.runtime.backward(total_loss)
+                        self._accumulation_cursor += 1
+                        if self._accumulation_cursor > geometry.accumulation:
+                            raise TrainingRestartRequired(
+                                "runtime accumulation cursor exceeded configured accumulation"
+                            )
                         if not self.runtime.sync_gradients:
                             continue
+                        if self._accumulation_cursor != geometry.accumulation:
+                            raise TrainingRestartRequired(
+                                "runtime synchronized before the configured accumulation group completed"
+                            )
 
                         step_error: BaseException | None = None
                         skipped = False
@@ -440,17 +452,19 @@ class BalalaikaTrainer:
                         self._coordinate_local_phase(step_error is None, "optimizer")
                         if step_error is not None:
                             raise step_error
-                        self._safe_for_recovery = True
+                        self._accumulation_cursor = 0
                         self._coordinated_recovery = True
 
                         if skipped:
-                            if self._synchronized_stop_requested():
-                                return self._save_recovery(
-                                    model, progress, checkpoint_metadata, reason="signal-after-skipped-step"
-                                )
+                            self._safe_for_recovery = False
+                            # Observe and latch a remote request, but a skipped
+                            # optimizer attempt is not a durable update and may
+                            # never be checkpointed as if it were one.
+                            self._synchronized_stop_requested()
                             continue
 
                         due = progress.complete_optimizer_step(geometry)
+                        self._safe_for_recovery = True
                         for boundary_index in due:
                             checkpoint = self.checkpoint_manager.save_same_stage(
                                 _accelerator(self.runtime),
@@ -467,12 +481,19 @@ class BalalaikaTrainer:
         except BaseException as error:
             if isinstance(error, TrainingRestartRequired):
                 raise
+            if isinstance(error, CheckpointCollectiveError):
+                raise self._restart_required(error) from error
             if self._pending_boundary_checkpoint is not None:
                 # The boundary checkpoint precedes evaluation by contract and is
                 # the exact state from which the durable evaluator resumes.
                 self.last_durable_checkpoint = self._pending_boundary_checkpoint
                 raise
-            if self._safe_for_recovery and self._coordinated_recovery and progress.optimizer_step > 0:
+            if (
+                self._safe_for_recovery
+                and self._accumulation_cursor == 0
+                and self._coordinated_recovery
+                and progress.optimizer_step > 0
+            ):
                 try:
                     self._save_recovery(model, progress, checkpoint_metadata, reason=type(error).__name__)
                 except BaseException as save_error:
@@ -484,7 +505,10 @@ class BalalaikaTrainer:
     def _coordinate_local_phase(self, succeeded: bool, description: str) -> None:
         status = torch.tensor([1 if succeeded else 0], dtype=torch.int8, device=self.runtime.device)
         self._coordinated_recovery = False
-        gathered = self.runtime.gather(status).reshape(-1)
+        try:
+            gathered = self.runtime.gather(status).reshape(-1)
+        except BaseException as error:
+            raise self._restart_required(error) from error
         self._coordinated_recovery = True
         if not bool((gathered == 1).all().item()) and succeeded:
             raise RuntimeError(f"peer rank failed during {description} before the next distributed collective")
@@ -508,9 +532,17 @@ class BalalaikaTrainer:
             device=self.runtime.device,
         )
         self._coordinated_recovery = False
-        gathered = self.runtime.gather(requested).reshape(-1)
+        try:
+            gathered = self.runtime.gather(requested).reshape(-1)
+        except BaseException as error:
+            raise self._restart_required(error) from error
         self._coordinated_recovery = True
-        return bool((gathered != 0).any().item())
+        stopped = bool((gathered != 0).any().item())
+        if stopped and self._stop_signal is None:
+            # A non-signalled rank must retain the distributed decision across
+            # AMP-overflow retries just like the rank that caught the signal.
+            self._stop_signal = 0
+        return stopped
 
     def _save_recovery(
         self,
@@ -520,7 +552,7 @@ class BalalaikaTrainer:
         *,
         reason: str,
     ) -> Path:
-        if progress.microstep % int(metadata["accumulation"]) != 0:
+        if self._accumulation_cursor != 0 or not self._safe_for_recovery:
             raise TrainingRestartRequired("cannot save recovery inside an incomplete accumulation group")
         self.runtime.barrier()
         path = self.checkpoint_manager.save_recovery(
@@ -539,20 +571,75 @@ class BalalaikaTrainer:
         checkpoint: Path,
         boundary: EvaluationBoundary,
     ) -> Path:
-        if self.boundary_marker is None:
-            existing = self._completed_marker(checkpoint, boundary)
-            if existing is not None:
-                return existing
         self._pending_boundary_checkpoint = checkpoint
+        if self.boundary_marker is None:
+            existing = self._completed_marker_collectively(checkpoint, boundary)
+            if existing is not None:
+                self._pending_boundary_checkpoint = None
+                return existing
         evaluator = self.evaluator_factory(boundary, checkpoint)
         evaluator.run(model, audio_vae, checkpoint, boundary)
-        marker = (
-            self.boundary_marker(boundary, checkpoint)
-            if self.boundary_marker is not None
-            else self._write_completed_marker(checkpoint, boundary)
-        )
+        marker = self._write_boundary_marker_collectively(checkpoint, boundary)
         self._pending_boundary_checkpoint = None
         return marker
+
+    def _completed_marker_collectively(
+        self,
+        checkpoint: Path,
+        boundary: EvaluationBoundary,
+    ) -> Path | None:
+        existing: Path | None = None
+        local_error: BaseException | None = None
+        if self.runtime.rank == 0:
+            try:
+                existing = self._completed_marker(checkpoint, boundary)
+            except BaseException as error:
+                local_error = error
+        outcome = torch.tensor(
+            [0 if local_error is not None else 1, 1 if existing is not None else 0],
+            dtype=torch.int8,
+            device=self.runtime.device,
+        )
+        try:
+            gathered = self.runtime.gather(outcome).reshape(-1, 2)
+        except BaseException as error:
+            self._coordinated_recovery = False
+            raise self._restart_required(error) from error
+        if int(gathered[0, 0].item()) != 1:
+            if local_error is not None:
+                raise local_error
+            raise RuntimeError("main rank failed while checking the completed boundary marker")
+        if int(gathered[0, 1].item()) == 1:
+            return existing or self._marker_path(checkpoint)
+        return None
+
+    def _write_boundary_marker_collectively(
+        self,
+        checkpoint: Path,
+        boundary: EvaluationBoundary,
+    ) -> Path:
+        marker = self._marker_path(checkpoint)
+        local_error: BaseException | None = None
+        if self.runtime.rank == 0:
+            try:
+                marker = (
+                    self.boundary_marker(boundary, checkpoint)
+                    if self.boundary_marker is not None
+                    else self._write_completed_marker(checkpoint, boundary)
+                )
+            except BaseException as error:
+                local_error = error
+        status = torch.tensor([0 if local_error is not None else 1], dtype=torch.int8, device=self.runtime.device)
+        try:
+            gathered = self.runtime.gather(status).reshape(-1)
+        except BaseException as error:
+            self._coordinated_recovery = False
+            raise self._restart_required(error) from error
+        if not bool((gathered == 1).all().item()):
+            if local_error is not None:
+                raise local_error
+            raise RuntimeError("main rank failed while publishing the completed boundary marker")
+        return Path(marker)
 
     def _completed_marker(self, checkpoint: Path, boundary: EvaluationBoundary) -> Path | None:
         path = self._marker_path(checkpoint)
@@ -561,10 +648,12 @@ class BalalaikaTrainer:
         expected = self._marker_value(checkpoint, boundary)
         try:
             actual = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as error:
+        except OSError as error:
             raise TrainerConfigurationError(f"cannot read completed boundary marker {path}: {error}") from error
+        except json.JSONDecodeError:
+            return None
         if actual != expected:
-            raise TrainerConfigurationError(f"completed boundary marker identity changed: {path}")
+            return None
         return path
 
     def _write_completed_marker(self, checkpoint: Path, boundary: EvaluationBoundary) -> Path:
@@ -693,6 +782,7 @@ class BalalaikaTrainer:
         consumed = progress.microstep - progress.epoch * geometry.microsteps_per_epoch
         if not 0 <= consumed <= geometry.microsteps_per_epoch:
             raise TrainerConfigurationError("resume microstep is outside the active epoch")
+        _set_loader_epoch(loader, progress.sampler_epoch)
         iterator = iter(loader)
         for _ in range(consumed):
             try:
@@ -706,7 +796,30 @@ class BalalaikaTrainer:
                 # An AMP-overflow skip consumes data but not optimizer progress.
                 # Replay the deterministic epoch until the planned real update
                 # count is reached; complete groups are still the only unit.
+                _set_loader_epoch(loader, progress.sampler_epoch)
                 iterator = iter(loader)
+
+    def _is_exact_validation_boundary(
+        self,
+        progress: TrainingProgress,
+        geometry: EpochGeometry,
+    ) -> bool:
+        if progress.boundary == 0:
+            return False
+        return progress.optimizer_step == geometry.validation_steps(progress.epoch)[progress.boundary - 1]
+
+    def _validate_curriculum(self) -> None:
+        mandated = {"stage1": (2, 1e-4), "stage2": (3, 5e-5)}
+        for name, (epochs, learning_rate) in mandated.items():
+            config = getattr(self.config, name, None)
+            actual = (
+                getattr(config, "epochs", None) if config is not None else None,
+                getattr(config, "learning_rate", None) if config is not None else None,
+            )
+            if actual != (epochs, learning_rate):
+                raise TrainerConfigurationError(
+                    f"mandated curriculum requires {name} epochs={epochs} and learning_rate={learning_rate}"
+                )
 
     def _restart_required(
         self,

@@ -7,6 +7,7 @@ from safetensors.torch import load_file, save_file
 
 from voxcpm.training.balalaika.artifacts import fingerprint
 from voxcpm.training.balalaika.checkpoint import (
+    CheckpointCollectiveError,
     CheckpointError,
     CheckpointManager,
     CheckpointMismatch,
@@ -55,8 +56,6 @@ class WrappedModel:
 
 
 class FakeAccelerator:
-    is_main_process = True
-
     def __init__(
         self,
         model,
@@ -68,6 +67,8 @@ class FakeAccelerator:
         optimizer_count=1,
         scheduler_count=1,
         checkpointable_count=1,
+        is_main_process=True,
+        gathered_statuses=(),
     ):
         self.model = model
         self.fail_save = fail_save
@@ -77,10 +78,16 @@ class FakeAccelerator:
         self.optimizer_count = optimizer_count
         self.scheduler_count = scheduler_count
         self.checkpointable_count = checkpointable_count
+        self.is_main_process = is_main_process
+        self.process_index = 0 if is_main_process else 1
+        self.device = torch.device("cpu")
+        self.gathered_statuses = list(gathered_statuses)
         self.save_hooks = []
         self.load_hooks = []
         self.checkpointables = []
         self.load_state_calls = 0
+        self.wait_calls = 0
+        self.gather_calls = 0
 
     def register_save_state_pre_hook(self, hook):
         self.save_hooks.append(hook)
@@ -95,7 +102,13 @@ class FakeAccelerator:
             self.checkpointables.append(checkpointable)
 
     def wait_for_everyone(self):
-        pass
+        self.wait_calls += 1
+
+    def gather_for_metrics(self, value):
+        self.gather_calls += 1
+        if self.gathered_statuses:
+            return torch.tensor(self.gathered_statuses.pop(0), dtype=value.dtype, device=value.device)
+        return value
 
     def unwrap_model(self, model):
         return getattr(model, "module", model)
@@ -326,6 +339,84 @@ def test_interrupted_temporary_checkpoint_is_ignored_and_latest_is_unchanged(tmp
     assert manager.latest() == complete_path
     assert (tmp_path / "latest.json").read_bytes() == latest_before
     assert all(path.name.startswith(".") for path in tmp_path.iterdir() if "tmp" in path.name)
+
+
+def test_rank_local_state_save_failure_is_published_before_raise(tmp_path):
+    model = FakeModel()
+    accelerator = FakeAccelerator(model, fail_save=True)
+    progress = TrainingProgress(stage="stage1", epoch=0, boundary=1, microstep=8, optimizer_step=2, global_step=2)
+
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        CheckpointManager(tmp_path).save_same_stage(accelerator, model, progress, checkpoint_metadata())
+
+    assert accelerator.gather_calls == 2  # setup outcome, then state-save outcome
+    assert accelerator.wait_calls == 1
+
+
+def test_peer_observes_rank_local_state_save_failure_before_trailing_barrier(tmp_path):
+    model = FakeModel()
+    accelerator = FakeAccelerator(
+        model,
+        is_main_process=False,
+        gathered_statuses=([1, 1], [0, 1]),
+    )
+    progress = TrainingProgress(stage="stage1", epoch=0, boundary=1, microstep=8, optimizer_step=2, global_step=2)
+
+    with pytest.raises(CheckpointError, match="peer rank failed.*state save"):
+        CheckpointManager(tmp_path).save_same_stage(accelerator, model, progress, checkpoint_metadata())
+
+    assert accelerator.gather_calls == 2
+    assert accelerator.wait_calls == 1
+
+
+def test_broken_checkpoint_outcome_collective_requires_process_restart(tmp_path):
+    model = FakeModel()
+    accelerator = FakeAccelerator(model)
+
+    def broken_gather(value):
+        raise RuntimeError("gloo connection closed")
+
+    accelerator.gather_for_metrics = broken_gather
+    progress = TrainingProgress(stage="stage1", epoch=0, boundary=1, microstep=8, optimizer_step=2, global_step=2)
+
+    with pytest.raises(CheckpointCollectiveError, match="process restart required"):
+        CheckpointManager(tmp_path).save_same_stage(accelerator, model, progress, checkpoint_metadata())
+
+    assert accelerator.wait_calls == 0
+
+
+def test_peer_observes_main_finalize_failure_before_leaving_publication_phase(tmp_path):
+    model = FakeModel()
+    accelerator = FakeAccelerator(
+        model,
+        is_main_process=False,
+        gathered_statuses=([1, 1], [1, 1], [0, 1]),
+    )
+    progress = TrainingProgress(stage="stage1", epoch=0, boundary=1, microstep=8, optimizer_step=2, global_step=2)
+
+    with pytest.raises(CheckpointError, match="main rank failed.*finalize"):
+        CheckpointManager(tmp_path).save_same_stage(accelerator, model, progress, checkpoint_metadata())
+
+    assert accelerator.gather_calls == 3
+    assert accelerator.wait_calls == 2
+
+
+def test_main_finalize_failure_is_published_before_original_error_is_raised(tmp_path, monkeypatch):
+    model = FakeModel()
+    accelerator = FakeAccelerator(model, gathered_statuses=([1, 1], [1, 1], [0, 1]))
+    progress = TrainingProgress(stage="stage1", epoch=0, boundary=1, microstep=8, optimizer_step=2, global_step=2)
+    manager = CheckpointManager(tmp_path)
+
+    def fail_finalize(checkpoint, metadata):
+        raise OSError("rank-zero finalize failed")
+
+    monkeypatch.setattr(manager, "_finalize_metadata", fail_finalize)
+
+    with pytest.raises(OSError, match="rank-zero finalize failed"):
+        manager.save_same_stage(accelerator, model, progress, checkpoint_metadata())
+
+    assert accelerator.gather_calls == 3
+    assert accelerator.wait_calls == 2
 
 
 def test_missing_accelerate_state_category_is_rejected_during_publication(tmp_path):

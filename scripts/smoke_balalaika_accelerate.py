@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Real tiny-GPU smoke for Balalaika Accelerate semantics; never loads VoxCPM."""
+"""Real tiny-device smokes for Balalaika Accelerate semantics; never loads VoxCPM."""
 
 from __future__ import annotations
 
@@ -149,7 +149,11 @@ class _WorkerValidationTracking:
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=("train-checkpoint", "probe-rank-fault", "validation"), required=True)
+    parser.add_argument(
+        "--mode",
+        choices=("train-checkpoint", "probe-rank-fault", "validation", "trainer-regressions"),
+        required=True,
+    )
     parser.add_argument("--runtime", choices=("accelerate",), default="accelerate")
     parser.add_argument("--items", type=int, default=32)
     return parser.parse_args()
@@ -460,6 +464,122 @@ def _run_probe_rank_fault() -> None:
         )
 
 
+def _run_trainer_regressions() -> None:
+    """Exercise scheduler ownership and deterministic overflow replay on eight real ranks."""
+    runtime = AccelerateRuntime.create(SimpleNamespace(accumulation=_ACCUMULATION, cpu=True))
+    if runtime.world_size != 8:
+        raise RuntimeError(f"trainer-regressions smoke requires exactly eight processes, found {runtime.world_size}")
+    torch.manual_seed(1907)
+
+    real_step_target = 3
+    total_samples = runtime.world_size * _ACCUMULATION * real_step_target
+    model = _TinyLoRAModel().to(runtime.device)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda _step: 1.0)
+    initial_scheduler_epoch = scheduler.last_epoch
+    loader = DataLoader(
+        _SyntheticSamples(total_samples),
+        batch_size=1,
+        shuffle=True,
+        drop_last=True,
+    )
+
+    prepare_calls = 0
+    prepare_calls += 1
+    model, optimizer, loader, scheduler = runtime.prepare(model, optimizer, loader, scheduler)
+
+    sampler_epoch = 17
+    real_steps = 0
+    sync_attempts = 0
+    passes: list[list[int]] = []
+    while real_steps < real_step_target:
+        loader.set_epoch(sampler_epoch)
+        local_ids: list[int] = []
+        for batch in loader:
+            local_ids.extend(int(value) for value in batch["id"].tolist())
+            with runtime.accumulate(model):
+                loss = torch.nn.functional.mse_loss(model(batch["input"]), batch["target"])
+                runtime.backward(loss)
+                if not runtime.sync_gradients:
+                    continue
+                sync_attempts += 1
+                if sync_attempts == real_step_target:
+                    # Synthetic AMP overflow: consume the complete group but
+                    # do not advance optimizer, scheduler, or durable progress.
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
+                real_steps += 1
+                if real_steps == real_step_target:
+                    break
+        passes.append(local_ids)
+
+    if len(passes) != 2 or passes[1] != passes[0][: len(passes[1])]:
+        raise AssertionError(f"same-epoch replay changed sample order on rank {runtime.rank}: {passes}")
+
+    loader.set_epoch(sampler_epoch + 1)
+    next_epoch_ids = [int(value) for batch in loader for value in batch["id"].tolist()]
+    next_epoch_changed = next_epoch_ids != passes[0]
+    underlying_scheduler = getattr(scheduler, "scheduler", scheduler)
+    scheduler_steps = int(underlying_scheduler.last_epoch - initial_scheduler_epoch)
+    local_evidence = torch.tensor(
+        [
+            real_steps,
+            sync_attempts,
+            scheduler_steps,
+            int(passes[1] == passes[0][: len(passes[1])]),
+            int(next_epoch_changed),
+            prepare_calls,
+        ],
+        dtype=torch.int64,
+        device=runtime.device,
+    )
+    gathered = runtime.gather(local_evidence).reshape(runtime.world_size, -1).cpu()
+    expected = torch.tensor(
+        [real_step_target, real_step_target + 1, real_step_target, 1, 1, 1],
+        dtype=torch.int64,
+    )
+    if not torch.equal(gathered, expected.expand_as(gathered)):
+        raise AssertionError(f"trainer regression evidence differs across ranks: {gathered.tolist()}")
+    print(
+        "TRAINER_REGRESSION_RANK_EVIDENCE "
+        + json.dumps(
+            {
+                "rank": runtime.rank,
+                "world_size": runtime.world_size,
+                "first_epoch_ids": passes[0],
+                "replay_ids": passes[1],
+                "next_epoch_ids": next_epoch_ids,
+                "real_optimizer_steps": real_steps,
+                "sync_attempts": sync_attempts,
+                "scheduler_steps": scheduler_steps,
+                "prepare_calls": prepare_calls,
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+    if runtime.rank == 0:
+        print(
+            "TRAINER_REGRESSION_RESULT "
+            + json.dumps(
+                {
+                    "status": "PASS",
+                    "world_size": runtime.world_size,
+                    "real_optimizer_steps": real_step_target,
+                    "scheduler_steps": real_step_target,
+                    "same_epoch_replay": True,
+                    "next_epoch_increment": 1,
+                    "prepare_calls": prepare_calls,
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+
+
 def _write_validation_prompt(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with wave.open(str(path), "wb") as audio:
@@ -614,6 +734,8 @@ def main() -> None:
         _run_probe_rank_fault()
     elif args.mode == "validation":
         _run_validation(args.items)
+    elif args.mode == "trainer-regressions":
+        _run_trainer_regressions()
 
 
 if __name__ == "__main__":

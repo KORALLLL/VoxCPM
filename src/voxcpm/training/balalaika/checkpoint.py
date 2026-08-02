@@ -25,6 +25,10 @@ class CheckpointMismatch(CheckpointError):
     """A checkpoint does not match the immutable requested training identity."""
 
 
+class CheckpointCollectiveError(CheckpointError):
+    """Checkpoint outcome coordination broke and all processes must restart."""
+
+
 class CheckpointRestoreError(CheckpointError):
     """A restore mutated process state and requires a process restart."""
 
@@ -143,23 +147,39 @@ class CheckpointManager:
         temporary = self.root / f".{checkpoint_name}.tmp"
         is_main_process = bool(accelerator.is_main_process)
 
-        self.root.mkdir(parents=True, exist_ok=True)
+        setup_error: BaseException | None = None
         if is_main_process:
-            if destination.exists():
-                raise FileExistsError(f"immutable checkpoint already exists: {destination}")
-            if temporary.exists():
-                shutil.rmtree(temporary)
-            temporary.mkdir(parents=False)
+            try:
+                self.root.mkdir(parents=True, exist_ok=True)
+                if destination.exists():
+                    raise FileExistsError(f"immutable checkpoint already exists: {destination}")
+                if temporary.exists():
+                    shutil.rmtree(temporary)
+                temporary.mkdir(parents=False)
+            except BaseException as error:
+                setup_error = error
+        self._publish_phase_outcome(accelerator, setup_error, "checkpoint setup", main_only=True)
         accelerator.wait_for_everyone()
 
-        self._register_progress(accelerator, progress)
-        hook = accelerator.register_save_state_pre_hook(self._save_adapter_hook(accelerator, model))
+        save_error: BaseException | None = None
+        hook: Any | None = None
         try:
+            self._register_progress(accelerator, progress)
+            hook = accelerator.register_save_state_pre_hook(self._save_adapter_hook(accelerator, model))
             accelerator.save_state(str(temporary))
+        except BaseException as error:
+            save_error = error
         finally:
-            hook.remove()
+            if hook is not None:
+                try:
+                    hook.remove()
+                except BaseException as error:
+                    if save_error is None:
+                        save_error = error
+        self._publish_phase_outcome(accelerator, save_error, "Accelerate state save")
         accelerator.wait_for_everyone()
 
+        finalize_error: BaseException | None = None
         if is_main_process:
             try:
                 complete_metadata = self._finalize_metadata(temporary, complete_metadata)
@@ -172,13 +192,39 @@ class CheckpointManager:
                     self.root / "latest.json",
                     {"checkpoint": checkpoint_name, "fingerprint": complete_metadata["checkpoint_fingerprint"]},
                 )
-            except BaseException:
+            except BaseException as error:
                 # A hidden sibling temporary directory is intentionally not a checkpoint.
-                raise
+                finalize_error = error
+        self._publish_phase_outcome(accelerator, finalize_error, "checkpoint finalize", main_only=True)
         accelerator.wait_for_everyone()
+        verify_error: BaseException | None = None
         if not destination.is_dir():
-            raise CheckpointError(f"checkpoint publication did not complete: {destination}")
+            verify_error = CheckpointError(f"checkpoint publication did not complete: {destination}")
+        self._publish_phase_outcome(accelerator, verify_error, "checkpoint visibility")
         return destination
+
+    @staticmethod
+    def _publish_phase_outcome(
+        accelerator: Any,
+        local_error: BaseException | None,
+        description: str,
+        *,
+        main_only: bool = False,
+    ) -> None:
+        device = getattr(accelerator, "device", torch.device("cpu"))
+        status = torch.tensor([0 if local_error is not None else 1], dtype=torch.int8, device=device)
+        try:
+            gathered = accelerator.gather_for_metrics(status).reshape(-1)
+        except BaseException as collective_error:
+            raise CheckpointCollectiveError(f"{description} outcome collective failed; process restart required") from (
+                local_error or collective_error
+            )
+        if bool((gathered == 1).all().item()):
+            return
+        if local_error is not None:
+            raise local_error
+        owner = "main rank" if main_only else "peer rank"
+        raise CheckpointError(f"{owner} failed during {description}")
 
     def resume_same_stage(
         self,

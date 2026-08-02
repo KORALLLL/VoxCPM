@@ -9,10 +9,12 @@ import pytest
 import torch
 
 from voxcpm.training.balalaika.artifacts import sha256_file
+from voxcpm.training.balalaika.checkpoint import CheckpointCollectiveError
 from voxcpm.training.balalaika.schedule import TrainingProgress
 from voxcpm.training.balalaika.trainer import (
     ApprovalRequired,
     BalalaikaTrainer,
+    TrainerConfigurationError,
     TrainingRestartRequired,
     build_model,
 )
@@ -50,13 +52,16 @@ class FakeRuntime:
         signal_after_sync=None,
         fail_backward_at=None,
         skipped_sync_attempts=(),
+        rank=0,
+        world_size=1,
+        gathered_values=(),
     ):
         self.events = events
         self.accumulation = accumulation
         self.signal_after_sync = signal_after_sync
         self.fail_backward_at = fail_backward_at
-        self.rank = 0
-        self.world_size = 1
+        self.rank = rank
+        self.world_size = world_size
         self.device = torch.device("cpu")
         self.sync_gradients = False
         self.accumulate_calls = 0
@@ -68,6 +73,7 @@ class FakeRuntime:
         self.backward_values = []
         self.accelerator = self
         self.skipped_sync_attempts = set(skipped_sync_attempts)
+        self.gathered_values = list(gathered_values)
 
     @property
     def optimizer_step_was_skipped(self):
@@ -100,6 +106,8 @@ class FakeRuntime:
 
     def gather(self, value):
         self.gather_calls += 1
+        if self.gathered_values:
+            return torch.tensor(self.gathered_values.pop(0), dtype=value.dtype, device=value.device)
         sync_attempt = self.accumulate_calls // self.accumulation
         if self.signal_after_sync == sync_attempt:
             return torch.ones_like(value)
@@ -262,6 +270,8 @@ def _make_trainer(
     microbatch_selector=None,
     batch_processor=None,
     loader_factory_override=None,
+    config_override=None,
+    use_default_marker=False,
 ):
     events = [] if runtime is None else runtime.events
     runtime = runtime or FakeRuntime(events, accumulation=accumulation)
@@ -325,7 +335,7 @@ def _make_trainer(
         return path
 
     trainer = BalalaikaTrainer(
-        _config(tmp_path),
+        config_override or _config(tmp_path),
         runtime,
         checkpoint_manager=manager,
         evaluator_factory=lambda boundary, checkpoint: evaluator,
@@ -340,7 +350,7 @@ def _make_trainer(
         optimizer_factory=optimizer_factory,
         scheduler_factory=scheduler_factory,
         microbatch_selector=microbatch_selector,
-        boundary_marker=marker,
+        boundary_marker=None if use_default_marker else marker,
         accumulation=accumulation,
         warmup_fraction=0.25,
         loss_weights={"loss/diff": 0.5, "loss/stop": 2.0},
@@ -471,6 +481,19 @@ def test_skipped_optimizer_attempt_does_not_advance_scheduler_or_progress(tmp_pa
     assert fixture.manager.boundaries[-1]["optimizer_step"] == 16
 
 
+def test_stop_request_survives_skipped_attempt_until_next_real_update(tmp_path):
+    events = []
+    runtime = FakeRuntime(events, skipped_sync_attempts={1}, signal_after_sync=1)
+    fixture = _make_trainer(tmp_path, stage1_rows=8, runtime=runtime)
+
+    result = fixture.trainer.run_stage(1)
+
+    assert result.name == "recovery-0001"
+    assert fixture.optimizers[0].step_calls == 2
+    assert fixture.schedulers[0].step_calls == 1
+    assert fixture.manager.recoveries[-1]["optimizer_step"] == 1
+
+
 def test_stage2_loads_final_stage1_adapter_before_fresh_optimizer_and_resets_all_stage_progress(tmp_path):
     source = tmp_path / "stage1-final"
     source.mkdir()
@@ -549,6 +572,111 @@ def test_recovery_resume_does_not_falsely_rerun_last_completed_boundary(tmp_path
 
     assert fixture.evaluator.steps == []
     assert fixture.manager.recoveries[-1]["optimizer_step"] == 12
+
+
+def test_recovery_resume_at_exact_boundary_finishes_missing_validation_before_update(tmp_path):
+    checkpoint = tmp_path / "resume-recovery"
+    checkpoint.mkdir()
+    events = []
+    runtime = FakeRuntime(events, signal_after_sync=1)
+    manager = FakeCheckpointManager(tmp_path / "checkpoints", events)
+    manager.resume_kind = "recovery"
+    manager.resume_state = TrainingProgress(
+        stage="stage1",
+        epoch=0,
+        boundary=1,
+        microstep=10,
+        optimizer_step=10,
+        global_step=10,
+        sampler_seed=0,
+        sampler_epoch=0,
+    ).state_dict()
+    fixture = _make_trainer(
+        tmp_path,
+        runtime=runtime,
+        checkpoint_manager=manager,
+        resume_checkpoint=checkpoint,
+        use_default_marker=True,
+    )
+
+    fixture.trainer.run_stage(1)
+
+    names = [event[0] for event in fixture.events]
+    assert names.index("resume") < names.index("evaluate") < names.index("accumulate")
+    assert fixture.evaluator.steps.count(10) == 1
+
+
+def test_recovery_resume_at_exact_boundary_honors_matching_durable_marker(tmp_path):
+    checkpoint = tmp_path / "resume-recovery"
+    checkpoint.mkdir()
+    events = []
+    runtime = FakeRuntime(events, signal_after_sync=1)
+    manager = FakeCheckpointManager(tmp_path / "checkpoints", events)
+    manager.resume_kind = "recovery"
+    progress = TrainingProgress(
+        stage="stage1",
+        epoch=0,
+        boundary=1,
+        microstep=10,
+        optimizer_step=10,
+        global_step=10,
+        sampler_seed=0,
+        sampler_epoch=0,
+    )
+    manager.resume_state = progress.state_dict()
+    fixture = _make_trainer(
+        tmp_path,
+        runtime=runtime,
+        checkpoint_manager=manager,
+        resume_checkpoint=checkpoint,
+        use_default_marker=True,
+    )
+    (checkpoint / "metadata.json").write_text(json.dumps({"checkpoint_fingerprint": "recovery-10"}), encoding="utf-8")
+    boundary = fixture.trainer._evaluation_boundary(progress, total_steps=160)
+    marker_path = fixture.trainer._marker_path(checkpoint)
+    marker_path.parent.mkdir(parents=True)
+    marker_path.write_text(json.dumps(fixture.trainer._marker_value(checkpoint, boundary)), encoding="utf-8")
+
+    fixture.trainer.run_stage(1)
+
+    assert fixture.evaluator.steps == []
+    assert fixture.manager.recoveries[-1]["optimizer_step"] == 11
+
+
+def test_recovery_resume_at_exact_boundary_replaces_mismatched_marker_before_update(tmp_path):
+    checkpoint = tmp_path / "resume-recovery"
+    checkpoint.mkdir()
+    events = []
+    runtime = FakeRuntime(events, signal_after_sync=1)
+    manager = FakeCheckpointManager(tmp_path / "checkpoints", events)
+    manager.resume_kind = "recovery"
+    manager.resume_state = TrainingProgress(
+        stage="stage1",
+        epoch=0,
+        boundary=1,
+        microstep=10,
+        optimizer_step=10,
+        global_step=10,
+        sampler_seed=0,
+        sampler_epoch=0,
+    ).state_dict()
+    fixture = _make_trainer(
+        tmp_path,
+        runtime=runtime,
+        checkpoint_manager=manager,
+        resume_checkpoint=checkpoint,
+        use_default_marker=True,
+    )
+    marker_path = fixture.trainer._marker_path(checkpoint)
+    marker_path.parent.mkdir(parents=True)
+    marker_path.write_text(json.dumps({"status": "complete", "checkpoint": "wrong"}), encoding="utf-8")
+
+    fixture.trainer.run_stage(1)
+
+    names = [event[0] for event in fixture.events]
+    assert names.index("evaluate") < names.index("accumulate")
+    assert fixture.evaluator.steps == [10]
+    assert json.loads(marker_path.read_text(encoding="utf-8"))["checkpoint_fingerprint"] == "recovery-10"
 
 
 def test_same_stage2_recovery_resume_does_not_require_stage1_checkpoint(tmp_path):
@@ -653,6 +781,154 @@ def test_coordinated_exception_saves_safe_recovery_and_reraises_original(tmp_pat
     assert fixture.runtime.barrier_calls >= 1
 
 
+def test_forward_failure_mid_accumulation_group_requires_restart_without_recovery(tmp_path):
+    calls = 0
+
+    def processor(batch):
+        nonlocal calls
+        calls += 1
+        if calls == 4:
+            raise ValueError("mid-group forward failure")
+        return {"value": batch}
+
+    fixture = _make_trainer(tmp_path, stage1_rows=17, accumulation=2, batch_processor=processor)
+
+    with pytest.raises(TrainingRestartRequired, match="last durable checkpoint") as raised:
+        fixture.trainer.run_stage(1)
+
+    assert isinstance(raised.value.__cause__, ValueError)
+    assert fixture.manager.recoveries == []
+    assert fixture.manager.boundaries[-1]["optimizer_step"] == 1
+
+
+def test_loader_failure_mid_accumulation_group_requires_restart_without_recovery(tmp_path):
+    class FailingLoader:
+        def __iter__(self):
+            for index in range(3):
+                yield torch.tensor([float(index + 1)])
+            raise OSError("mid-group loader failure")
+
+    fixture = _make_trainer(
+        tmp_path,
+        stage1_rows=17,
+        accumulation=2,
+        loader_factory_override=lambda dataset, **kwargs: FailingLoader(),
+    )
+
+    with pytest.raises(TrainingRestartRequired, match="last durable checkpoint") as raised:
+        fixture.trainer.run_stage(1)
+
+    assert isinstance(raised.value.__cause__, OSError)
+    assert fixture.manager.recoveries == []
+    assert fixture.manager.boundaries[-1]["optimizer_step"] == 1
+
+
+def test_replay_reuses_sampler_epoch_and_next_real_epoch_increments_once(tmp_path):
+    class EpochLoader:
+        def __init__(self, dataset):
+            self.dataset = dataset
+            self.epochs = []
+
+        def set_epoch(self, epoch):
+            self.epochs.append(epoch)
+
+        def __iter__(self):
+            return iter(self.dataset)
+
+    holder = {}
+
+    def loader_factory(dataset, **kwargs):
+        holder["loader"] = EpochLoader(dataset)
+        return holder["loader"]
+
+    events = []
+    runtime = FakeRuntime(events, skipped_sync_attempts={8})
+    fixture = _make_trainer(
+        tmp_path,
+        stage1_rows=8,
+        runtime=runtime,
+        loader_factory_override=loader_factory,
+    )
+
+    fixture.trainer.run_stage(1)
+
+    assert holder["loader"].epochs[:3] == [0, 0, 1]
+
+
+def test_main_rank_marker_failure_is_published_before_original_error(tmp_path):
+    events = []
+    runtime = FakeRuntime(events, rank=0, world_size=2, gathered_values=([0, 1],))
+    fixture = _make_trainer(tmp_path, runtime=runtime)
+    model = TinyModel()
+    audio_vae = model.audio_vae
+    checkpoint = tmp_path / "boundary"
+    checkpoint.mkdir()
+    (checkpoint / "metadata.json").write_text(json.dumps({"checkpoint_fingerprint": "boundary-1"}), encoding="utf-8")
+    boundary = fixture.trainer._evaluation_boundary(
+        TrainingProgress(stage="stage1", boundary=1, optimizer_step=1, global_step=1),
+        total_steps=16,
+    )
+
+    def fail_marker(boundary, checkpoint):
+        raise OSError("marker disk failure")
+
+    fixture.trainer.boundary_marker = fail_marker
+
+    with pytest.raises(OSError, match="marker disk failure"):
+        fixture.trainer._finish_boundary(model, audio_vae, checkpoint, boundary)
+
+    assert runtime.gather_calls == 1
+
+
+def test_peer_rank_observes_main_marker_failure_without_writing_marker(tmp_path):
+    events = []
+    runtime = FakeRuntime(events, rank=1, world_size=2, gathered_values=([0, 1],))
+    fixture = _make_trainer(tmp_path, runtime=runtime)
+    model = TinyModel()
+    audio_vae = model.audio_vae
+    checkpoint = tmp_path / "boundary"
+    checkpoint.mkdir()
+    (checkpoint / "metadata.json").write_text(json.dumps({"checkpoint_fingerprint": "boundary-1"}), encoding="utf-8")
+    boundary = fixture.trainer._evaluation_boundary(
+        TrainingProgress(stage="stage1", boundary=1, optimizer_step=1, global_step=1),
+        total_steps=16,
+    )
+    marker_called = False
+
+    def marker(boundary, checkpoint):
+        nonlocal marker_called
+        marker_called = True
+        return tmp_path / "should-not-exist"
+
+    fixture.trainer.boundary_marker = marker
+
+    with pytest.raises(RuntimeError, match="main rank failed.*marker"):
+        fixture.trainer._finish_boundary(model, audio_vae, checkpoint, boundary)
+
+    assert marker_called is False
+    assert runtime.gather_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("stage", "field", "value"),
+    [
+        (1, "epochs", 3),
+        (1, "learning_rate", 2e-4),
+        (2, "epochs", 2),
+        (2, "learning_rate", 1e-4),
+    ],
+)
+def test_curriculum_rejects_stage_epoch_or_learning_rate_drift_before_model_setup(tmp_path, stage, field, value):
+    config = _config(tmp_path)
+    setattr(getattr(config, f"stage{stage}"), field, value)
+    fixture = _make_trainer(tmp_path, config_override=config)
+
+    with pytest.raises(TrainerConfigurationError, match="mandated curriculum"):
+        fixture.trainer.run_stage(stage)
+
+    assert all(event[0] != "model" for event in fixture.events)
+
+
 def test_rank_local_dataloader_failure_is_coordinated_before_recovery(tmp_path):
     class FailingLoader:
         def __iter__(self):
@@ -672,8 +948,9 @@ def test_rank_local_dataloader_failure_is_coordinated_before_recovery(tmp_path):
         fixture.trainer.run_stage(1)
 
     # Eleven successful batches use fetch + forward + optimizer + stop
-    # collectives. The failing fetch contributes one final status collective.
-    assert runtime.gather_calls == 45
+    # collectives. Boundary-marker publication and the failing fetch each add
+    # one collective outcome.
+    assert runtime.gather_calls == 46
     assert fixture.manager.recoveries[-1]["optimizer_step"] == 11
 
 
@@ -688,3 +965,25 @@ def test_broken_backward_collective_does_not_attempt_divergent_recovery_save(tmp
     assert isinstance(raised.value.__cause__, RuntimeError)
     assert fixture.manager.recoveries == []
     assert fixture.manager.boundaries[-1]["optimizer_step"] == 10
+
+
+def test_broken_checkpoint_outcome_collective_does_not_attempt_recovery_save(tmp_path):
+    events = []
+
+    class BrokenCheckpointManager(FakeCheckpointManager):
+        def save_same_stage(self, accelerator, model, progress, metadata, *, name=None):
+            raise CheckpointCollectiveError("checkpoint outcome collective failed; process restart required")
+
+    manager = BrokenCheckpointManager(tmp_path / "checkpoints", events)
+    fixture = _make_trainer(
+        tmp_path,
+        stage1_rows=8,
+        runtime=FakeRuntime(events),
+        checkpoint_manager=manager,
+    )
+
+    with pytest.raises(TrainingRestartRequired, match="last durable checkpoint") as raised:
+        fixture.trainer.run_stage(1)
+
+    assert isinstance(raised.value.__cause__, CheckpointCollectiveError)
+    assert manager.recoveries == []
