@@ -17,3 +17,9 @@
 - Decision: Completion queries require the evaluator's current deterministic inputs and seed. Bulk completion receives an ID-to-`(inputs, seed)` mapping or callback, so stored inputs alone can never establish reuse.
 - Decision: After `onnx_asr.load_model`, inspect the local package's documented adapter-to-ASR ownership (`adapter.asr._encoder`, `_decoder`, `_joiner`) and require every discovered model session to report CUDA as primary on the requested device. CPU-only pre/post-processing is not inspected as a model session.
 - Validation: Targeted RED tests covered missing mutation claims, token/rank/lease takeover, current-input completion, active CPU fallback, unlisted `.onnx`, directory fsync, and interrupted pending attempt caps. GREEN: 24 focused tests and 139 full-suite tests passed; Black, compile, and diff checks passed.
+
+## 2026-08-02 - Rank-zero W&B validation tracking
+
+- Decision: Worker ranks receive a `NullRunManager`, so only the main process dynamically imports, initializes, logs, or finishes W&B. Memorization, stage 1, and stage 2 persist independent UUIDs before `wandb.init(..., resume="allow")`, while sharing the configured experiment group.
+- Decision: A validation handoff is immutable and rejects any boundary other than 2,000 unique scored IDs and four existing local WAVs. Each upload builds a fresh W&B table and retains the selection-owned audio ID order in captions.
+- Decision: Write an atomic pending boundary manifest before `run.log`; fsync the W&B run directory and atomically mark it complete only after `run.log` returns. Completed matching manifests suppress duplicate uploads on resume; failed or pending boundaries remain incomplete and retryable.
