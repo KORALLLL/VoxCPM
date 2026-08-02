@@ -15,6 +15,7 @@ import torchaudio
 from torch.utils.data import DataLoader, Dataset, RandomSampler, Sampler
 
 from ..data import VoxCPMCollator
+from .index import IndexIntegrityError, normalize_identity
 
 
 class DatasetIntegrityError(RuntimeError):
@@ -152,11 +153,25 @@ class IndexedBalalaikaDataset(Dataset[dict[str, Any]]):
         return descriptor
 
     def _read_range(self, path: Path, offset: int, size: int, label: str) -> bytes:
-        if not isinstance(offset, int) or not isinstance(size, int) or offset < 0 or size <= 0:
+        if (
+            isinstance(offset, bool)
+            or isinstance(size, bool)
+            or not isinstance(offset, int)
+            or not isinstance(size, int)
+            or offset < 0
+            or size <= 0
+        ):
             raise DatasetIntegrityError(f"invalid {label} byte range")
         try:
-            payload = os.pread(self._descriptor(path), size, offset)
+            descriptor = self._descriptor(path)
+            file_size = os.fstat(descriptor).st_size
         except OSError as error:
+            raise DatasetIntegrityError(f"cannot read {label} byte range") from error
+        if offset > file_size or size > file_size - offset:
+            raise DatasetIntegrityError(f"invalid {label} byte range")
+        try:
+            payload = os.pread(descriptor, size, offset)
+        except (MemoryError, OSError, OverflowError) as error:
             raise DatasetIntegrityError(f"cannot read {label} byte range") from error
         if len(payload) != size:
             raise DatasetIntegrityError(f"truncated {label} byte range")
@@ -168,7 +183,14 @@ class IndexedBalalaikaDataset(Dataset[dict[str, Any]]):
             row = json.loads(payload.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
             raise DatasetIntegrityError("malformed sidecar byte range") from error
-        if not isinstance(row, dict) or row.get("source_relative_path") != identity:
+        if not isinstance(row, dict):
+            raise DatasetIntegrityError("sidecar identity does not match indexed sample")
+        try:
+            indexed_identity = normalize_identity(identity, "indexed sample")
+            sidecar_identity = normalize_identity(row.get("source_relative_path"), "sidecar row")
+        except IndexIntegrityError as error:
+            raise DatasetIntegrityError("sidecar identity is invalid") from error
+        if sidecar_identity != indexed_identity:
             raise DatasetIntegrityError("sidecar identity does not match indexed sample")
         text = row.get("rover_punctuated_accented")
         if not isinstance(text, str) or not text.strip():

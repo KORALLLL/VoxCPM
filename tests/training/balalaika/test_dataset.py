@@ -16,6 +16,7 @@ from voxcpm.training.balalaika.dataset import (
     IndexedBalalaikaDataset,
     build_unsharded_dataloader,
 )
+from voxcpm.training.balalaika import dataset as dataset_module
 from voxcpm.training.balalaika.index import build_index
 from voxcpm.training.data import HFVoxCPMDataset, VoxCPMCollator
 
@@ -100,6 +101,32 @@ def test_indexed_dataset_rejects_sidecar_identity_mismatch(synthetic_index):
     ds = IndexedBalalaikaDataset(synthetic_index.path, sidecar, stage=1, tokenizer=lambda text: [1])
 
     with pytest.raises(DatasetIntegrityError, match="sidecar identity"):
+        ds[0]
+
+
+def test_indexed_dataset_normalizes_equivalent_sidecar_identity(synthetic_index):
+    """Catches rejecting a valid sidecar path that uses Task 3's non-canonical spelling."""
+    sidecar = synthetic_index.sidecar
+    sidecar.write_bytes(sidecar.read_bytes().replace(b"000000/a.wav", b"000000\\\\a.wav", 1))
+    with sqlite3.connect(synthetic_index.path) as database:
+        database.execute("UPDATE samples SET sidecar_size = sidecar_size + 1 WHERE stage = 1")
+    ds = IndexedBalalaikaDataset(synthetic_index.path, sidecar, stage=1, tokenizer=lambda text: [len(text)])
+
+    assert ds[0]["text_ids"] == [len("тест один")]
+
+
+def test_indexed_dataset_rejects_oversized_range_before_pread(synthetic_index, monkeypatch):
+    """Catches a corrupt positive size reaching pread before file-size validation."""
+    with sqlite3.connect(synthetic_index.path) as database:
+        database.execute("UPDATE samples SET audio_size = ? WHERE stage = 1", (2**63 - 1,))
+
+    def fail_if_read(*_args, **_kwargs):
+        raise AssertionError("pread must not run for an oversized range")
+
+    monkeypatch.setattr(dataset_module.os, "pread", fail_if_read)
+    ds = IndexedBalalaikaDataset(synthetic_index.path, synthetic_index.sidecar, stage=1, tokenizer=lambda text: [1])
+
+    with pytest.raises(DatasetIntegrityError, match="audio byte range"):
         ds[0]
 
 

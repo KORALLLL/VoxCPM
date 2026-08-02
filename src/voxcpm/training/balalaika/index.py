@@ -256,7 +256,7 @@ def _scan_source_tar(path: Path) -> dict[str, object]:
             for member in archive:
                 if not member.isfile():
                     continue
-                member_path = _normalize_identity(member.name, "source tar member")
+                member_path = normalize_identity(member.name, "source tar member")
                 suffix = PurePosixPath(member_path).suffix.lower()
                 stem = str(PurePosixPath(member_path).with_suffix(""))
                 if suffix in _AUDIO_SUFFIXES:
@@ -562,7 +562,7 @@ def _finish_database(database: sqlite3.Connection) -> None:
 def _identity_from_row(payload: object, context: str) -> str:
     if not isinstance(payload, dict):
         raise IndexIntegrityError(f"malformed JSON object in {context}")
-    return _normalize_identity(payload.get("source_relative_path"), context)
+    return normalize_identity(payload.get("source_relative_path"), context)
 
 
 def _agreement_from_row(payload: object, context: str) -> float | None:
@@ -593,7 +593,8 @@ def _duration_from_row(payload: object) -> float | None:
     return duration
 
 
-def _normalize_identity(value: object, context: str) -> str:
+def normalize_identity(value: object, context: str) -> str:
+    """Return Task 3's canonical POSIX source-relative identity."""
     if not isinstance(value, str) or not value:
         raise IndexIntegrityError(f"missing source_relative_path in {context}")
     path = PurePosixPath(value.replace("\\", "/"))
