@@ -19,6 +19,8 @@ class FakeSession:
         self.result = result
         self.calls: list[tuple[object, int]] = []
         self.closed = 0
+        self.active_providers: list[str] | None = None
+        self.device_id: int | None = None
 
     def recognize(self, waveform, *, sample_rate: int):
         self.calls.append((waveform, sample_rate))
@@ -26,6 +28,14 @@ class FakeSession:
 
     def close(self) -> None:
         self.closed += 1
+
+    def get_providers(self) -> list[str]:
+        return self.active_providers or []
+
+    def get_provider_options(self) -> dict[str, dict[str, str]]:
+        if self.device_id is None:
+            return {}
+        return {"CUDAExecutionProvider": {"device_id": str(self.device_id)}}
 
 
 class FakeOnnxAsr:
@@ -37,6 +47,11 @@ class FakeOnnxAsr:
     def load_model(self, model: str, path: Path | None = None, *, providers=None):
         self.calls.append((model, path))
         self.providers = providers
+        if self.session.active_providers is None:
+            self.session.active_providers = [
+                provider[0] if isinstance(provider, tuple) else provider for provider in providers
+            ]
+            self.session.device_id = providers[0][1]["device_id"]
         return self.session
 
 
@@ -129,6 +144,19 @@ def test_gigaam_rejects_requested_cuda_provider_when_unavailable(
     assert fake_onnx_asr.calls == []
 
 
+def test_gigaam_rejects_a_loaded_session_that_falls_back_to_cpu(
+    fake_onnx_asr: FakeOnnxAsr, pinned_model: tuple[Path, str], wav_path: Path
+):
+    """Catches a CUDA-capable runtime silently constructing a CPU-primary model session."""
+    fake_onnx_asr.session.active_providers = ["CPUExecutionProvider"]
+    model_dir, model_fingerprint = pinned_model
+
+    with pytest.raises(GigaAMProviderError, match="active CUDA.*device 0"):
+        GigaAMRNNT(model_dir, device_id=0, model_fingerprint=model_fingerprint).transcribe(wav_path)
+
+    assert fake_onnx_asr.session.closed == 1
+
+
 def test_gigaam_rejects_a_tampered_pin_before_opening_a_session(
     fake_onnx_asr: FakeOnnxAsr, pinned_model: tuple[Path, str], wav_path: Path
 ):
@@ -137,6 +165,19 @@ def test_gigaam_rejects_a_tampered_pin_before_opening_a_session(
     (model_dir / "model.onnx").write_bytes(b"tampered")
 
     with pytest.raises(ValueError, match="pinned GigaAM file hash"):
+        GigaAMRNNT(model_dir, device_id=0, model_fingerprint=model_fingerprint).transcribe(wav_path)
+
+    assert fake_onnx_asr.calls == []
+
+
+def test_gigaam_rejects_an_unmanifested_consumable_model_file(
+    fake_onnx_asr: FakeOnnxAsr, pinned_model: tuple[Path, str], wav_path: Path
+):
+    """Catches a locally added ONNX artifact escaping the immutable Hub pin coverage."""
+    model_dir, model_fingerprint = pinned_model
+    (model_dir / "unlisted_model.onnx").write_bytes(b"unlisted")
+
+    with pytest.raises(ValueError, match="not covered by the GigaAM Hub pin"):
         GigaAMRNNT(model_dir, device_id=0, model_fingerprint=model_fingerprint).transcribe(wav_path)
 
     assert fake_onnx_asr.calls == []

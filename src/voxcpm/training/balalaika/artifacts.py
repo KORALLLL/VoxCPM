@@ -30,6 +30,11 @@ def atomic_json(path: Path, value: Mapping[str, Any]) -> None:
             temporary.flush()
             os.fsync(temporary.fileno())
         os.replace(temporary_path, path)
+        directory_descriptor = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
     except BaseException:
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)

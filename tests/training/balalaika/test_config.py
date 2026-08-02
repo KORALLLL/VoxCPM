@@ -1,5 +1,7 @@
 import json
+from pathlib import Path
 
+from voxcpm.training.balalaika import artifacts as artifacts_module
 from voxcpm.training.balalaika.artifacts import atomic_json
 from voxcpm.training.balalaika.config import BalalaikaConfig
 
@@ -35,6 +37,29 @@ def test_atomic_json_never_leaves_temporary_file(tmp_path):
     atomic_json(target, {"step": 7})
     assert json.loads(target.read_text()) == {"step": 7}
     assert list(tmp_path.glob(".*.tmp")) == []
+
+
+def test_atomic_json_fsyncs_the_containing_directory_after_rename(tmp_path, monkeypatch):
+    """Catches a renamed manifest being reported durable before its directory entry is flushed."""
+    opened: dict[int, Path] = {}
+    synced: list[int] = []
+    real_open = artifacts_module.os.open
+    real_fsync = artifacts_module.os.fsync
+
+    def observe_open(path, flags, mode=0o777):
+        descriptor = real_open(path, flags, mode)
+        opened[descriptor] = Path(path).resolve()
+        return descriptor
+
+    def observe_fsync(descriptor):
+        synced.append(descriptor)
+        return real_fsync(descriptor)
+
+    monkeypatch.setattr(artifacts_module.os, "open", observe_open)
+    monkeypatch.setattr(artifacts_module.os, "fsync", observe_fsync)
+    atomic_json(tmp_path / "state.json", {"step": 8})
+
+    assert any(opened.get(descriptor) == tmp_path.resolve() for descriptor in synced)
 
 
 def test_config_load_resolves_index_dir_outside_corpus_root(tmp_path):

@@ -1,31 +1,46 @@
-"""Atomic per-item state for resumable distributed validation."""
+"""Atomic, authorised per-item state for resumable distributed validation."""
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 import fcntl
 import hashlib
 import json
 from pathlib import Path
+import secrets
 import time
-from typing import Any, Iterator, Mapping
+from typing import Any
 
 from .artifacts import atomic_json, fingerprint, sha256_file
 
 _STAGES = frozenset({"generation", "asr"})
+_ExpectedItem = tuple[Mapping[str, Any], int | None]
 
 
 class ValidationLedgerError(RuntimeError):
     """Raised when a ledger transition is invalid for the durable item state."""
 
 
+@dataclass(frozen=True)
+class ValidationClaim:
+    """An opaque, single-owner lease authorising one item's state transitions."""
+
+    item_id: int
+    rank: int
+    token: str
+    epoch: int
+
+
 class ValidationLedger:
     """One atomically replaced JSON record per globally unique benchmark item ID.
 
-    Each operation takes an advisory lock only for one item file.  That makes
-    writes from ranks with disjoint partitions independent while still keeping a
-    duplicate assignment from publishing two competing records for the same ID.
+    Each record has a leased :class:`ValidationClaim`.  Every mutation checks
+    that claim while holding the item lock, so a rank that was rejected or whose
+    lease became stale cannot overwrite a newer owner.  Locks are per item,
+    letting disjoint distributed partitions publish independently.
     """
 
     def __init__(
@@ -71,38 +86,53 @@ class ValidationLedger:
         item_id: int,
         *,
         rank: int = 0,
-        inputs: Mapping[str, Any] | None = None,
-        attempt_seed: int | None = None,
-    ) -> bool:
-        """Atomically claim an incomplete item unless another live rank owns it."""
+        inputs: Mapping[str, Any],
+        attempt_seed: int | None,
+    ) -> ValidationClaim | None:
+        """Lease an incomplete item or return ``None`` when it is unavailable.
+
+        ``inputs`` and ``attempt_seed`` are the caller-current deterministic
+        assignment.  They are compared before reusing any stored WAV/ASR output.
+        """
         if rank < 0:
             raise ValueError("rank cannot be negative.")
+        normalized_inputs = _normalize_inputs(inputs)
         with self._locked_record(item_id) as record:
-            changed = self._prepare_for_reuse(record, inputs=inputs, attempt_seed=attempt_seed)
-            if self._is_complete_record(record) or self._exhausted(record):
-                if changed:
-                    self._write_record(item_id, record)
-                return False
             owner = record.get("owner")
-            if isinstance(owner, dict) and not self._owner_is_stale(owner):
+            if isinstance(owner, Mapping) and not self._owner_is_stale(owner):
+                return None
+            if isinstance(owner, Mapping):
+                record["owner"] = None
+
+            changed = self._prepare_for_current_inputs(record, normalized_inputs, attempt_seed)
+            if self._is_complete_record(record, normalized_inputs, attempt_seed) or self._exhausted(record):
                 if changed:
                     self._write_record(item_id, record)
-                return False
-            record["owner"] = {"rank": rank, "claimed_at": _timestamp()}
+                return None
+
+            epoch = int(record.get("claim_epoch", 0)) + 1
+            token = secrets.token_urlsafe(32)
+            record["claim_epoch"] = epoch
+            record["owner"] = {
+                "rank": rank,
+                "token": token,
+                "epoch": epoch,
+                "claimed_at": _timestamp(),
+            }
             self._touch(record)
             self._write_record(item_id, record)
-            return True
+            return ValidationClaim(item_id=_item_id(item_id), rank=rank, token=token, epoch=epoch)
 
     def record_generation(
         self,
         item_id: int,
         *,
+        claim: ValidationClaim | None,
         wav_sha256: str,
         path: str | Path,
-        attempt_seed: int | None = None,
         elapsed_seconds: float | None = None,
     ) -> None:
-        """Record a generated WAV only after its supplied digest verifies on disk."""
+        """Record a generated WAV only for the live owner and legal source state."""
         actual_path = self._resolve_wav_path(path)
         if not actual_path.is_file():
             raise FileNotFoundError(f"Generated WAV is missing: {actual_path}")
@@ -110,8 +140,12 @@ class ValidationLedger:
         if actual_hash != wav_sha256:
             raise ValueError(f"Generated WAV hash does not match for {actual_path}.")
         with self._locked_record(item_id) as record:
-            self._prepare_for_reuse(record, inputs=None, attempt_seed=attempt_seed)
-            if self._stage_exhausted(record, "generation"):
+            self._authorize(record, item_id, claim)
+            if record["generation"].get("status") not in {"pending", "failed"}:
+                raise ValidationLedgerError(f"Invalid generation state for item {_item_id(item_id)}.")
+            if record["asr"].get("status") != "pending":
+                raise ValidationLedgerError(f"Invalid ASR state before generation for item {_item_id(item_id)}.")
+            if self._attempt_cap_reached(record, "generation"):
                 raise ValidationLedgerError(f"Generation retry cap reached for item {_item_id(item_id)}.")
             record["attempts"]["generation"] += 1
             record["generation"] = {
@@ -124,23 +158,30 @@ class ValidationLedger:
                 "completed_at": _timestamp(),
                 "exception": None,
             }
-            self._reset_asr(record, reset_attempts=True)
-            record["owner"] = None
             self._touch(record)
             self._write_record(item_id, record)
 
-    def record_asr(self, item_id: int, *, hypothesis: str, elapsed_seconds: float | None = None) -> None:
+    def record_asr(
+        self,
+        item_id: int,
+        *,
+        claim: ValidationClaim | None,
+        hypothesis: str,
+        elapsed_seconds: float | None = None,
+    ) -> None:
         """Persist an ASR success, including a valid empty-string hypothesis."""
         if not isinstance(hypothesis, str):
             raise TypeError("ASR hypothesis must be a string.")
         with self._locked_record(item_id) as record:
-            self._prepare_for_reuse(record, inputs=None, attempt_seed=None)
-            if self._stage_exhausted(record, "asr"):
-                raise ValidationLedgerError(f"ASR retry cap reached for item {_item_id(item_id)}.")
-            if record["generation"]["status"] != "success" or not self._wav_is_valid(record):
+            self._authorize(record, item_id, claim)
+            if record["generation"].get("status") != "success" or not self._wav_is_valid(record):
                 raise ValidationLedgerError(
-                    f"Cannot record ASR for item {_item_id(item_id)} without a verified generated WAV."
+                    f"Cannot record ASR for item {_item_id(item_id)} without a successful generation."
                 )
+            if record["asr"].get("status") not in {"pending", "failed"}:
+                raise ValidationLedgerError(f"Invalid ASR state for item {_item_id(item_id)}.")
+            if self._attempt_cap_reached(record, "asr"):
+                raise ValidationLedgerError(f"ASR retry cap reached for item {_item_id(item_id)}.")
             record["attempts"]["asr"] += 1
             record["asr"] = {
                 "status": "success",
@@ -155,15 +196,28 @@ class ValidationLedger:
             self._touch(record)
             self._write_record(item_id, record)
 
-    def record_failure(self, item_id: int, *, stage: str, exception: BaseException | str) -> None:
-        """Persist an exception as incomplete state for bounded deterministic retry."""
+    def record_failure(
+        self,
+        item_id: int,
+        *,
+        claim: ValidationClaim | None,
+        stage: str,
+        exception: BaseException | str,
+    ) -> None:
+        """Persist a legal stage failure, releasing ownership for its bounded retry."""
         if stage not in _STAGES:
             raise ValueError(f"Unknown validation stage: {stage!r}")
         with self._locked_record(item_id) as record:
-            self._prepare_for_reuse(record, inputs=None, attempt_seed=None)
-            record["attempts"][stage] += 1
+            self._authorize(record, item_id, claim)
+            if self._attempt_cap_reached(record, stage):
+                raise ValidationLedgerError(f"{stage.title()} retry cap reached for item {_item_id(item_id)}.")
             error = _exception_record(exception)
             if stage == "generation":
+                if record["generation"].get("status") not in {"pending", "failed"}:
+                    raise ValidationLedgerError(f"Invalid generation state for item {_item_id(item_id)}.")
+                if record["asr"].get("status") != "pending":
+                    raise ValidationLedgerError(f"Invalid ASR state before generation for item {_item_id(item_id)}.")
+                record["attempts"]["generation"] += 1
                 record["generation"] = {
                     "status": "failed",
                     "wav_path": None,
@@ -176,6 +230,13 @@ class ValidationLedger:
                 }
                 self._reset_asr(record, reset_attempts=True)
             else:
+                if record["generation"].get("status") != "success" or not self._wav_is_valid(record):
+                    raise ValidationLedgerError(
+                        f"Cannot record ASR failure for item {_item_id(item_id)} without a successful generation."
+                    )
+                if record["asr"].get("status") not in {"pending", "failed"}:
+                    raise ValidationLedgerError(f"Invalid ASR state for item {_item_id(item_id)}.")
+                record["attempts"]["asr"] += 1
                 record["asr"] = {
                     "status": "failed",
                     "hypothesis": None,
@@ -189,23 +250,35 @@ class ValidationLedger:
             self._touch(record)
             self._write_record(item_id, record)
 
-    def is_complete(self, item_id: int) -> bool:
-        """Return whether an item remains valid for reuse under these fingerprints."""
+    def is_complete(self, item_id: int, *, inputs: Mapping[str, Any], attempt_seed: int | None) -> bool:
+        """Return whether this caller's current deterministic assignment is complete."""
+        normalized_inputs = _normalize_inputs(inputs)
         path = self.item_path(item_id)
         if not path.is_file():
             return False
         with self._locked_record(item_id, create=False) as record:
-            return self._is_complete_record(record)
+            return self._is_complete_record(record, normalized_inputs, attempt_seed)
 
-    def complete_ids(self) -> set[int]:
-        """Return all globally complete IDs, irrespective of which rank wrote them."""
+    def complete_ids(
+        self,
+        expected_items: Mapping[int, _ExpectedItem] | Callable[[int], _ExpectedItem | None],
+    ) -> set[int]:
+        """Return only items valid against evaluator-current inputs for every ID.
+
+        ``expected_items`` is either an ID-to-``(inputs, seed)`` mapping or a
+        callback returning that tuple (or ``None`` to omit an ID).
+        """
         complete: set[int] = set()
         for path in sorted(self.items_dir.glob("*.json")):
             try:
                 item_id = int(path.stem)
             except ValueError:
                 continue
-            if self.is_complete(item_id):
+            expected = expected_items(item_id) if callable(expected_items) else expected_items.get(item_id)
+            if expected is None:
+                continue
+            inputs, attempt_seed = _expected_item(expected)
+            if self.is_complete(item_id, inputs=inputs, attempt_seed=attempt_seed):
                 complete.add(item_id)
         return complete
 
@@ -227,7 +300,7 @@ class ValidationLedger:
                 elif create:
                     record = self._new_record(normalized_id)
                 else:
-                    record = self._new_record(normalized_id)
+                    raise ValidationLedgerError(f"Ledger item record does not exist: {path}")
                 yield record
             finally:
                 fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
@@ -235,7 +308,7 @@ class ValidationLedger:
     def _new_record(self, item_id: int) -> dict[str, Any]:
         now = _timestamp()
         record: dict[str, Any] = {
-            "version": 1,
+            "version": 2,
             "id": item_id,
             "fingerprints": {"generation": self.generation_fingerprint, "asr": self.asr_fingerprint},
             "inputs": {},
@@ -245,17 +318,17 @@ class ValidationLedger:
             "generation": {},
             "asr": {},
             "owner": None,
+            "claim_epoch": 0,
             "created_at": now,
             "updated_at": now,
         }
         self._reset_generation(record, reset_attempts=False)
         return record
 
-    def _prepare_for_reuse(
+    def _prepare_for_current_inputs(
         self,
         record: dict[str, Any],
-        *,
-        inputs: Mapping[str, Any] | None,
+        normalized_inputs: Mapping[str, Any],
         attempt_seed: int | None,
     ) -> bool:
         changed = False
@@ -270,75 +343,81 @@ class ValidationLedger:
             fingerprints["generation"] = self.generation_fingerprint
             fingerprints["asr"] = self.asr_fingerprint
             self._reset_generation(record, reset_attempts=True)
-            record["owner"] = None
             changed = True
         elif asr_changed:
             fingerprints["asr"] = self.asr_fingerprint
             self._reset_asr(record, reset_attempts=True)
-            record["owner"] = None
             changed = True
 
-        if inputs is not None:
-            normalized_inputs = _normalize_inputs(inputs)
-            if record.get("inputs") != normalized_inputs or record.get("attempt_seed") != attempt_seed:
-                record["inputs"] = normalized_inputs
-                record["attempt_seed"] = attempt_seed
-                record["input_fingerprint"] = fingerprint({"inputs": normalized_inputs, "attempt_seed": attempt_seed})
-                self._reset_generation(record, reset_attempts=True)
-                record["owner"] = None
-                changed = True
-        elif attempt_seed is not None and record.get("attempt_seed") != attempt_seed:
-            record["attempt_seed"] = attempt_seed
-            record["input_fingerprint"] = fingerprint(
-                {"inputs": record.get("inputs", {}), "attempt_seed": attempt_seed}
-            )
-            self._reset_generation(record, reset_attempts=True)
-            record["owner"] = None
-            changed = True
-        elif record.get("input_fingerprint") != fingerprint(
-            {"inputs": record.get("inputs", {}), "attempt_seed": record.get("attempt_seed")}
+        current_input_fingerprint = fingerprint({"inputs": normalized_inputs, "attempt_seed": attempt_seed})
+        if (
+            record.get("inputs") != normalized_inputs
+            or record.get("attempt_seed") != attempt_seed
+            or record.get("input_fingerprint") != current_input_fingerprint
         ):
+            record["inputs"] = dict(normalized_inputs)
+            record["attempt_seed"] = attempt_seed
+            record["input_fingerprint"] = current_input_fingerprint
             self._reset_generation(record, reset_attempts=True)
-            record["input_fingerprint"] = fingerprint(
-                {"inputs": record.get("inputs", {}), "attempt_seed": record.get("attempt_seed")}
-            )
-            record["owner"] = None
             changed = True
-
-        if record["generation"].get("status") == "success" and not self._wav_is_valid(record):
+        elif record["generation"].get("status") == "success" and not self._wav_is_valid(record):
             self._reset_generation(record, reset_attempts=True)
-            record["owner"] = None
             changed = True
         elif record["asr"].get("status") == "success" and not self._asr_is_valid(record):
             self._reset_asr(record, reset_attempts=True)
-            record["owner"] = None
             changed = True
         if changed:
             self._touch(record)
         return changed
 
-    def _is_complete_record(self, record: Mapping[str, Any]) -> bool:
+    def _authorize(self, record: Mapping[str, Any], item_id: int, claim: ValidationClaim | None) -> None:
+        if not isinstance(claim, ValidationClaim):
+            raise ValidationLedgerError(f"A live validation claim is required for item {_item_id(item_id)}.")
+        if claim.item_id != _item_id(item_id):
+            raise ValidationLedgerError(f"Validation claim item does not match item {_item_id(item_id)}.")
+        owner = record.get("owner")
+        if not isinstance(owner, Mapping) or self._owner_is_stale(owner):
+            raise ValidationLedgerError(f"Validation claim is no longer live for item {_item_id(item_id)}.")
+        if owner.get("rank") != claim.rank:
+            raise ValidationLedgerError(
+                f"Validation claim owner rank does not match current owner for item {_item_id(item_id)}."
+            )
+        if owner.get("epoch") != claim.epoch or not isinstance(owner.get("token"), str):
+            raise ValidationLedgerError(f"Validation claim does not match current owner for item {_item_id(item_id)}.")
+        if not secrets.compare_digest(owner["token"], claim.token):
+            raise ValidationLedgerError(f"Validation claim does not match current owner for item {_item_id(item_id)}.")
+
+    def _is_complete_record(
+        self,
+        record: Mapping[str, Any],
+        expected_inputs: Mapping[str, Any],
+        expected_seed: int | None,
+    ) -> bool:
         fingerprints = record.get("fingerprints")
         return bool(
             isinstance(fingerprints, Mapping)
             and fingerprints.get("generation") == self.generation_fingerprint
             and fingerprints.get("asr") == self.asr_fingerprint
+            and self._inputs_are_current(record, expected_inputs, expected_seed)
             and record.get("generation", {}).get("status") == "success"
             and record.get("asr", {}).get("status") == "success"
-            and self._inputs_are_valid(record)
             and self._wav_is_valid(record)
             and self._asr_is_valid(record)
         )
 
-    def _inputs_are_valid(self, record: Mapping[str, Any]) -> bool:
-        inputs = record.get("inputs")
-        if not isinstance(inputs, Mapping):
+    def _inputs_are_current(
+        self,
+        record: Mapping[str, Any],
+        expected_inputs: Mapping[str, Any],
+        expected_seed: int | None,
+    ) -> bool:
+        if record.get("inputs") != expected_inputs or record.get("attempt_seed") != expected_seed:
             return False
         try:
-            expected = fingerprint({"inputs": dict(inputs), "attempt_seed": record.get("attempt_seed")})
+            expected_fingerprint = fingerprint({"inputs": dict(expected_inputs), "attempt_seed": expected_seed})
         except (TypeError, ValueError):
             return False
-        return record.get("input_fingerprint") == expected
+        return record.get("input_fingerprint") == expected_fingerprint
 
     def _wav_is_valid(self, record: Mapping[str, Any]) -> bool:
         generation = record.get("generation")
@@ -366,12 +445,20 @@ class ValidationLedger:
         )
 
     def _exhausted(self, record: Mapping[str, Any]) -> bool:
-        return self._stage_exhausted(record, "generation") or self._stage_exhausted(record, "asr")
+        generation = record.get("generation", {})
+        asr = record.get("asr", {})
+        return bool(
+            (generation.get("status") in {"pending", "failed"} and self._attempt_cap_reached(record, "generation"))
+            or (
+                generation.get("status") == "success"
+                and asr.get("status") in {"pending", "failed"}
+                and self._attempt_cap_reached(record, "asr")
+            )
+        )
 
-    def _stage_exhausted(self, record: Mapping[str, Any], stage: str) -> bool:
+    def _attempt_cap_reached(self, record: Mapping[str, Any], stage: str) -> bool:
         attempts = record.get("attempts", {})
-        stage_record = record.get(stage, {})
-        return bool(stage_record.get("status") == "failed" and attempts.get(stage, 0) >= self.max_attempts)
+        return attempts.get(stage, 0) >= self.max_attempts
 
     def _owner_is_stale(self, owner: Mapping[str, Any]) -> bool:
         claimed_at = owner.get("claimed_at")
@@ -438,6 +525,12 @@ def _normalize_inputs(inputs: Mapping[str, Any]) -> dict[str, Any]:
     except (TypeError, ValueError) as error:
         raise ValueError("Validation inputs must be JSON-serializable.") from error
     return json.loads(encoded)
+
+
+def _expected_item(value: _ExpectedItem) -> _ExpectedItem:
+    if not isinstance(value, tuple) or len(value) != 2 or not isinstance(value[0], Mapping):
+        raise ValueError("Expected validation item must be an (inputs, attempt_seed) tuple.")
+    return value
 
 
 def _text_hash(text: str) -> str:

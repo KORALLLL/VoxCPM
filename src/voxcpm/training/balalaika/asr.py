@@ -53,9 +53,7 @@ class GigaAMRNNT:
         session, self._session = self._session, None
         if session is None:
             return
-        _close_session(session)
-        del session
-        gc.collect()
+        _release_loaded_session(session)
 
     def _load_session(self) -> Any:
         if self._session is not None:
@@ -65,12 +63,21 @@ class GigaAMRNNT:
         onnxruntime = _import_dependency("onnxruntime")
         providers = _cuda_providers(onnxruntime, self.device_id)
         onnx_asr = _import_dependency("onnx_asr")
+        session: Any | None = None
         try:
-            self._session = onnx_asr.load_model(_MODEL_NAME, path=self.model_dir, providers=providers)
+            session = onnx_asr.load_model(_MODEL_NAME, path=self.model_dir, providers=providers)
+            _require_active_cuda(session, self.device_id)
+        except GigaAMProviderError:
+            if session is not None:
+                _release_loaded_session(session)
+            raise
         except BaseException as error:
+            if session is not None:
+                _release_loaded_session(session)
             raise GigaAMProviderError(
                 f"Could not load pinned {_MODEL_NAME} with CUDAExecutionProvider on device {self.device_id}."
             ) from error
+        self._session = session
         return self._session
 
     def _validate_pinned_model(self) -> None:
@@ -97,6 +104,7 @@ class GigaAMRNNT:
         files = pin.get("files")
         if not isinstance(files, dict) or not files:
             raise ValueError("GigaAM Hub pin must include hashes for local model files.")
+        manifest_files = set(files)
         for relative_path, expected_hash in files.items():
             if not isinstance(relative_path, str) or not isinstance(expected_hash, str):
                 raise ValueError("GigaAM Hub pin contains an invalid model file hash.")
@@ -105,6 +113,11 @@ class GigaAMRNNT:
                 raise ValueError(f"Pinned GigaAM model file is missing: {relative_path}")
             if sha256_file(candidate) != expected_hash:
                 raise ValueError(f"pinned GigaAM file hash does not match: {relative_path}")
+        for candidate in model_dir.rglob("*"):
+            if candidate.is_file() and _is_consumable_model_file(candidate.relative_to(model_dir)):
+                relative_path = candidate.relative_to(model_dir).as_posix()
+                if relative_path not in manifest_files:
+                    raise ValueError(f"Consumable model file is not covered by the GigaAM Hub pin: {relative_path}")
 
 
 def _import_dependency(name: str) -> Any:
@@ -153,19 +166,74 @@ def _normalize_result(result: Any) -> str:
     raise TypeError(f"Pinned GigaAM returned an invalid single-item result: {type(result).__name__}.")
 
 
-def _close_session(session: Any) -> None:
-    """Close known adapter/session shapes without relying on garbage collection."""
-    seen: set[int] = set()
-    candidates = [
-        session,
-        getattr(session, "session", None),
-        getattr(session, "asr", None),
-        getattr(session, "resampler", None),
+def _is_consumable_model_file(path: Path) -> bool:
+    """Return whether a local file can affect the loaded GigaAM model result."""
+    name = path.name.casefold()
+    if path.suffix.casefold() in {".onnx", ".ort"}:
+        return True
+    if name in {"config.json", "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json"}:
+        return True
+    return ("vocab" in path.stem.casefold() or "tokenizer" in path.stem.casefold()) and path.suffix.casefold() in {
+        ".json",
+        ".model",
+        ".txt",
+    }
+
+
+def _require_active_cuda(adapter: Any, device_id: int) -> None:
+    """Fail closed unless every discovered GigaAM model session is CUDA-primary."""
+    sessions = [
+        candidate for candidate in _asr_owned_objects(adapter) if callable(getattr(candidate, "get_providers", None))
     ]
-    for candidate in candidates:
+    if not sessions:
+        raise GigaAMProviderError("Pinned GigaAM adapter exposes no inspectable ONNX Runtime ASR sessions.")
+    for session in sessions:
+        providers = list(session.get_providers())
+        if not providers or providers[0] != "CUDAExecutionProvider":
+            raise GigaAMProviderError(
+                f"Pinned GigaAM has no active CUDAExecutionProvider on requested device {device_id}."
+            )
+        provider_options = getattr(session, "get_provider_options", None)
+        options = provider_options() if callable(provider_options) else {}
+        cuda_options = options.get("CUDAExecutionProvider") if isinstance(options, dict) else None
+        if not isinstance(cuda_options, dict) or str(cuda_options.get("device_id")) != str(device_id):
+            raise GigaAMProviderError(
+                f"Pinned GigaAM active CUDAExecutionProvider is not configured for requested device {device_id}."
+            )
+
+
+def _release_loaded_session(session: Any) -> None:
+    _close_session(session)
+    del session
+    gc.collect()
+
+
+def _asr_owned_objects(adapter: Any) -> list[Any]:
+    """Follow the documented onnx-asr adapter → ASR → model-session ownership shapes."""
+    seen: set[int] = set()
+    candidates = [getattr(adapter, "asr", adapter)]
+    owned: list[Any] = []
+    attributes = ("session", "_session", "_encoder", "_decoder", "_joiner", "_model", "sessions")
+    while candidates:
+        candidate = candidates.pop()
         if candidate is None or id(candidate) in seen:
             continue
         seen.add(id(candidate))
+        owned.append(candidate)
+        for attribute in attributes:
+            child = getattr(candidate, attribute, None)
+            if isinstance(child, dict):
+                candidates.extend(child.values())
+            elif isinstance(child, (list, tuple, set)):
+                candidates.extend(child)
+            elif child is not None:
+                candidates.append(child)
+    return owned
+
+
+def _close_session(session: Any) -> None:
+    """Close known adapter/session shapes without relying on garbage collection."""
+    for candidate in _asr_owned_objects(session):
         close = getattr(candidate, "close", None)
         if callable(close):
             close()
