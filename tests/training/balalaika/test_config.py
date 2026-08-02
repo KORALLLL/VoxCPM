@@ -35,3 +35,16 @@ def test_atomic_json_never_leaves_temporary_file(tmp_path):
     atomic_json(target, {"step": 7})
     assert json.loads(target.read_text()) == {"step": 7}
     assert list(tmp_path.glob(".*.tmp")) == []
+
+
+def test_config_load_resolves_index_dir_outside_corpus_root(tmp_path):
+    """Catches generated index artifacts being resolved into the immutable corpus."""
+    config_path = tmp_path / "balalaika.yaml"
+    config_path.write_text(
+        "data:\n" "  corpus_root: corpus\n" "  index_dir: prepared\n" "output_dir: runs\n",
+        encoding="utf-8",
+    )
+
+    config = BalalaikaConfig.load(config_path)
+
+    assert config.data.index_dir == tmp_path / "prepared"

@@ -15,6 +15,7 @@ class _ConfigModel(BaseModel):
 
 class DataConfig(_ConfigModel):
     corpus_root: Path
+    index_dir: Path = Path("artifacts/balalaika-index")
 
 
 class HubConfig(_ConfigModel):
@@ -80,10 +81,12 @@ class BalalaikaConfig(_ConfigModel):
         base_dir = path.parent.resolve()
         output_dir = _resolve_relative(config.output_dir, base_dir)
         local_dir = _resolve_relative(config.hub.local_dir, base_dir)
+        index_dir = _resolve_relative(config.data.index_dir, base_dir)
         return config.model_copy(
             update={
                 "output_dir": output_dir,
                 "hub": config.hub.model_copy(update={"local_dir": local_dir}),
+                "data": config.data.model_copy(update={"index_dir": index_dir}),
             }
         )
 
