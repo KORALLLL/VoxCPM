@@ -35,9 +35,10 @@ Biases (W&B) every one eighth of an epoch.
   `normalized_gold`.
 - Validation ASR: GigaAM v3 RNN-T, pinned to an immutable model/runtime
   identity in run metadata.
-- Validation uses 20 fixed reference voices and a fixed random assignment from
-  all 2,000 benchmark rows to those voices. Both selections are seed-controlled
-  and remain unchanged across checkpoints.
+- Validation uses 20 fixed audio prompts selected uniformly at random from the
+  joined corpus and a fixed random assignment from all 2,000 benchmark rows to
+  those prompts. Both selections are seed-controlled and remain unchanged
+  across checkpoints. No speaker identity or diversity constraint is applied.
 - The memorization experiment and large training are separate commands. Large
   training requires an explicit manual approval record tied to the completed
   memorization W&B run and checkpoint.
@@ -70,8 +71,8 @@ Preparation performs a strict identity join on `source_relative_path` among:
 
 It writes a compact indexed representation with the tar path, audio member
 offset and size, JSON member offset and size, normalized identity, selected
-text, agreement fields, speaker identity, duration, and relevant quality
-fields. Audio is not extracted or duplicated. The indexed audio reader uses
+text, agreement fields, available source metadata, and duration. Audio is not
+extracted or duplicated. The indexed audio reader uses
 direct offsets and cached read-only tar file handles.
 
 Preparation rejects:
@@ -86,9 +87,9 @@ Preparation rejects:
 
 The preparation audit includes total and eligible rows, exact stage sizes,
 null-agreement exclusions, other filtering reasons, per-shard counts, duration
-statistics, agreement distributions, valid-ASR-count distributions, and
-speaker counts. Each output records a fingerprint over all input identities,
-hashes, filtering rules, and preparation configuration.
+statistics, agreement distributions, and valid-ASR-count distributions. Each
+output records a fingerprint over all input identities, hashes, filtering
+rules, and preparation configuration.
 
 ### Indexed Dataset
 
@@ -99,12 +100,14 @@ when requested, and tokenizes `rover_punctuated_accented` for VoxCPM2.
 Training uses ordinary fixed-size shuffled batches. Duration bucketing is
 explicitly out of scope. On the primary path, the input DataLoader is not
 pre-sharded with a PyTorch `DistributedSampler`; Accelerate alone shards its
-seeded fixed-batch sampler across ranks. This avoids double sharding. The
-prepared loader gives each rank a disjoint subset and the same number of
-complete batches, exposes epoch reseeding through Accelerate's prepared-loader
-contract, and makes sample order a pure function of the recorded seed and
-epoch. Any remainder that cannot make an equal complete distributed batch is
-dropped and counted in run metadata. The controlled native DDP fallback uses
+seeded fixed-batch sampler across ranks. This avoids double sharding. Before
+preparation, the global fixed-batch stream is truncated to a multiple of world
+size times gradient accumulation. Accelerate's repeat-to-even behavior is
+disabled, so no early batch is duplicated. The prepared loader gives each rank
+a disjoint subset and the same number of complete accumulation groups, exposes
+epoch reseeding through Accelerate's prepared-loader contract, and makes sample
+order a pure function of the recorded seed and epoch. The dropped remainder is
+counted in run metadata. The controlled native DDP fallback uses
 `DistributedSampler` with equivalent seed, `drop_last`, and `set_epoch()`
 semantics because Accelerate is absent on that path.
 
@@ -117,15 +120,17 @@ tar files.
 Preparation creates versioned selection manifests for:
 
 - four memorization examples; and
-- 20 validation voice prompts.
+- 20 validation audio prompts.
 
-Both selections come from the `>= 0.95` pool, use distinct speakers, require
-single-speaker audio, and apply configurable duration and quality constraints.
-The default voice-prompt duration window is 3--10 seconds. If the configured
-constraints cannot produce enough distinct speakers, preparation fails and
-reports which constraint exhausted the pool rather than silently relaxing it.
+The four memorization examples are sampled from the `>= 0.95` pool. The 20
+validation prompts are sampled uniformly from all joined corpus rows with
+available audio and combined text. Both operations sample without replacement
+from rows sorted by stable identity and use recorded seeds. They do not require
+speaker labels, speaker diversity, single-speaker annotations, or quality
+ranking. Preparation fails only if the relevant pool contains fewer than the
+requested number of usable rows.
 
-The 2,000 benchmark-to-voice assignments are generated once from a recorded
+The 2,000 benchmark-to-prompt assignments are generated once from a recorded
 seed and stored by benchmark row ID. The prompt audio and the corresponding
 `rover_punctuated_accented` text are passed together to VoxCPM2 continuation
 generation.
@@ -220,7 +225,7 @@ planned full validations and stage 2 has 24 planned full validations.
 
 At each boundary, training synchronizes all ranks and enters evaluation mode.
 The 2,000 benchmark rows are divided deterministically across the eight ranks.
-Each row is synthesized from `stressed` using its preassigned voice prompt.
+Each row is synthesized from `stressed` using its preassigned audio prompt.
 Generated files are stored beneath a validation directory keyed by stage,
 epoch, boundary, benchmark revision, checkpoint fingerprint, and generation
 configuration.
@@ -260,7 +265,7 @@ to W&B. Each full validation logs:
 - all required aggregate and per-category metrics;
 - stage-relative and global progress;
 - configuration and input fingerprints;
-- a table with 2,000 item IDs, categories, input/gold/stressed text, voice ID,
+- a table with 2,000 item IDs, categories, input/gold/stressed text, prompt ID,
   ASR hypothesis, number spans, and item errors; and
 - four fixed benchmark generations as `wandb.Audio` entries.
 
@@ -319,7 +324,7 @@ Automated tests cover:
 - tar-member offset reads and bounded file-handle caching;
 - the exact `< 0.95` and `>= 0.95` split boundary;
 - exclusion and reporting of null agreement;
-- deterministic four-example, 20-voice, and 2,000-assignment manifests;
+- deterministic four-example, 20-prompt, and 2,000-assignment manifests;
 - Accelerate distributed sample uniqueness, equal batch counts, dropped
   remainders, gradient synchronization, and epoch reseeding;
 - exact one-eighth-epoch trigger calculation;
