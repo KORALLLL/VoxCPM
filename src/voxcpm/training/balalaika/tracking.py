@@ -176,6 +176,9 @@ class NullRunManager:
     ) -> None:
         return None
 
+    def log_memorization(self, pairs: Sequence[Mapping[str, object]], global_step: int) -> None:
+        return None
+
     def finish(self) -> None:
         return None
 
@@ -236,6 +239,51 @@ class WandbRunManager:
         payload = {str(key): value for key, value in metrics.items()}
         payload["train/global_step"] = int(global_step)
         self._run.log(payload, step=int(global_step))
+
+    def log_memorization(self, pairs: Sequence[Mapping[str, object]], global_step: int) -> None:
+        """Upload the complete four-pair manual-review payload in one W&B step."""
+        materialized = [dict(pair) for pair in pairs]
+        identities = [pair.get("sample_id") for pair in materialized]
+        if (
+            len(materialized) != 4
+            or len(set(identities)) != 4
+            or not all(isinstance(identity, str) and identity for identity in identities)
+        ):
+            raise ValueError("Memorization logging requires exactly four distinct sample identities.")
+        rows: list[list[object]] = []
+        reference_audio: list[object] = []
+        generated_audio: list[object] = []
+        for pair in materialized:
+            text = pair.get("text")
+            hypothesis = pair.get("asr_hypothesis")
+            reference_path = Path(str(pair.get("reference_audio", "")))
+            generated_path = Path(str(pair.get("generated_audio", "")))
+            if not isinstance(text, str) or not text or not isinstance(hypothesis, str):
+                raise ValueError("Memorization logging requires text and diagnostic transcript strings.")
+            if not reference_path.is_file() or not generated_path.is_file():
+                raise FileNotFoundError("Memorization logging requires complete local reference/generated WAV pairs.")
+            if reference_path.suffix.lower() != ".wav" or generated_path.suffix.lower() != ".wav":
+                raise ValueError("Memorization logging requires WAV reference/generated pairs.")
+            identity = str(pair["sample_id"])
+            reference = self._wandb.Audio(str(reference_path), caption=f"reference | {identity} | {text}")
+            generated = self._wandb.Audio(
+                str(generated_path),
+                caption=f"generated | {identity} | target={text} | asr={hypothesis}",
+            )
+            rows.append([identity, text, hypothesis, reference, generated])
+            reference_audio.append(reference)
+            generated_audio.append(generated)
+        self._run.log(
+            {
+                "memorization/pairs": self._wandb.Table(
+                    columns=["sample_id", "text", "asr_hypothesis", "reference_audio", "generated_audio"],
+                    data=rows,
+                ),
+                "memorization/reference_audio": reference_audio,
+                "memorization/generated_audio": generated_audio,
+            },
+            step=int(global_step),
+        )
 
     def log_validation(
         self,

@@ -813,6 +813,7 @@ def test_stage1_requires_an_injected_matching_manual_approval_before_model_setup
         "memorization": "approved",
         "base_revision": "base-sha",
         "data_fingerprint": "data-sha",
+        "selection_fingerprint": "selection-sha",
         "lora_fingerprint": "lora-sha",
     }
     assert all(event[0] != "model" for event in mismatch.events)

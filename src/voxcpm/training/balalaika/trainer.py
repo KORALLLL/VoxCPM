@@ -884,7 +884,8 @@ class BalalaikaTrainer:
         if self.approval_verifier is None or self.approval_path is None or self.approval_expected is None:
             raise ApprovalRequired("stage 1 requires an injected matching manual memorization approval verifier")
         current_identity = {
-            key: self.identity[key] for key in ("base_revision", "data_fingerprint", "lora_fingerprint")
+            key: self.identity[key]
+            for key in ("base_revision", "data_fingerprint", "selection_fingerprint", "lora_fingerprint")
         }
         conflicts = {
             key: (self.approval_expected[key], value)
