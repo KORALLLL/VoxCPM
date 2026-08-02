@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 from collections.abc import Mapping
 from pathlib import Path
@@ -24,21 +25,29 @@ class CheckpointMismatch(CheckpointError):
     """A checkpoint does not match the immutable requested training identity."""
 
 
+class CheckpointRestoreError(CheckpointError):
+    """A restore mutated process state and requires a process restart."""
+
+
 class CheckpointManager:
     """Publish and restore immutable boundary checkpoints beneath one root."""
 
-    _SCHEMA_VERSION = 1
+    _SCHEMA_VERSION = 2
     _ADAPTER_FILE = "adapter_model.safetensors"
     _METADATA_FILE = "metadata.json"
     _MANIFEST_FILE = "manifest.json"
-    _REQUIRED_METADATA = frozenset(
+    _REQUIRED_SUPPLIED_METADATA = frozenset(
         {
             "stage_epochs",
             "world_size",
             "microbatch",
             "accumulation",
             "global_batch_size",
-            "rng_state",
+            "optimizer_steps_per_epoch",
+            "optimizer_count",
+            "scheduler_count",
+            "checkpointable_count",
+            "stage_start_global_step",
             "base_revision",
             "evaluator_revision",
             "data_fingerprint",
@@ -52,27 +61,25 @@ class CheckpointManager:
     _PROGRESS_FIELDS = frozenset(
         {"stage", "epoch", "boundary", "microstep", "optimizer_step", "global_step", "sampler_seed", "sampler_epoch"}
     )
-    _FRESH_STAGE_FIELDS = frozenset(
+    _SAME_STAGE_EXPECTED_FIELDS = _REQUIRED_SUPPLIED_METADATA | frozenset({"stage", "sampler_seed"})
+    _STAGE2_EXPECTED_FIELDS = frozenset(
         {
-            "stage",
-            "stage_epochs",
-            "world_size",
-            "microbatch",
-            "accumulation",
-            "global_batch_size",
-            "rng_state",
+            "source_stage",
+            "source_stage_epochs",
+            "source_epoch",
+            "source_boundary",
+            "base_revision",
             "data_fingerprint",
             "selection_fingerprint",
-            "optimization_fingerprint",
-            "wandb_run_id",
-            "wandb_group",
-            *(_PROGRESS_FIELDS - {"stage"}),
+            "lora_fingerprint",
         }
     )
+    _SUPPORTED_DISTRIBUTED_TYPES = frozenset({"NO", "MULTI_CPU", "MULTI_GPU"})
 
     def __init__(self, root: Path):
         self.root = Path(root)
         self._registrations: set[tuple[int, int]] = set()
+        self._poisoned_reason: str | None = None
 
     def save_same_stage(
         self,
@@ -84,7 +91,10 @@ class CheckpointManager:
         name: str | None = None,
     ) -> Path:
         """Save adapter plus same-stage Accelerate state, then publish atomically."""
+        self._ensure_usable()
+        self._ensure_supported_accelerator(accelerator)
         complete_metadata = self._build_metadata(progress, metadata)
+        self._validate_accelerator_world_size(accelerator, complete_metadata["world_size"])
         checkpoint_name = name or self._checkpoint_name(progress)
         self._validate_checkpoint_name(checkpoint_name)
         destination = self.root / checkpoint_name
@@ -110,8 +120,8 @@ class CheckpointManager:
 
         if is_main_process:
             try:
+                complete_metadata = self._finalize_metadata(temporary, complete_metadata)
                 atomic_json(temporary / self._METADATA_FILE, complete_metadata)
-                self._require_state_categories(temporary)
                 self._write_manifest(temporary)
                 self._fsync_tree(temporary)
                 os.rename(temporary, destination)
@@ -138,19 +148,37 @@ class CheckpointManager:
         expected: Mapping[str, Any],
     ) -> dict[str, Any]:
         """Strictly verify and restore adapter, optimizer, scheduler, RNG, and progress."""
+        self._ensure_usable()
+        self._ensure_supported_accelerator(accelerator)
+        self._require_expected_identity(expected, self._SAME_STAGE_EXPECTED_FIELDS, "expected identity")
         checkpoint = Path(checkpoint)
         metadata = self.verify(checkpoint, expected)
+        self._validate_accelerator_world_size(accelerator, metadata["world_size"])
         if metadata["stage"] != progress.stage:
             raise CheckpointMismatch(
                 f"stage mismatch: checkpoint has {metadata['stage']!r}, progress expects {progress.stage!r}"
             )
 
+        target = accelerator.unwrap_model(model)
+        self._validate_adapter_keys(checkpoint / self._ADAPTER_FILE, target.state_dict())
+        self._preflight_progress(checkpoint, metadata)
         self._register_progress(accelerator, progress)
         hook = accelerator.register_load_state_pre_hook(self._load_adapter_hook(accelerator, model, checkpoint))
         try:
-            accelerator.load_state(str(checkpoint))
+            try:
+                accelerator.load_state(str(checkpoint))
+            except Exception as error:
+                self._poisoned_reason = f"Accelerate restore failed after model mutation: {error}"
+                raise CheckpointRestoreError(
+                    f"checkpoint restore failed after mutation; process restart required: {error}"
+                ) from error
         finally:
             hook.remove()
+        try:
+            self._assert_progress_matches_metadata(progress, metadata)
+        except CheckpointRestoreError as error:
+            self._poisoned_reason = str(error)
+            raise
         return metadata
 
     def load_stage_adapter(
@@ -163,21 +191,37 @@ class CheckpointManager:
         sampler_seed: int | None = None,
     ) -> dict[str, Any]:
         """Load a final stage-1 adapter without touching any Accelerate state."""
+        self._ensure_usable()
+        self._require_expected_identity(expected, self._STAGE2_EXPECTED_FIELDS, "expected source identity")
+        if (
+            not self._is_stage_one(expected["source_stage"])
+            or expected["source_epoch"] != expected["source_stage_epochs"] - 1
+            or expected["source_boundary"] != 8
+        ):
+            raise CheckpointMismatch("expected source identity does not describe a final stage1 checkpoint")
         checkpoint = Path(checkpoint)
-        compatible_expected = {key: value for key, value in expected.items() if key not in self._FRESH_STAGE_FIELDS}
+        compatible_expected = {
+            "stage": expected["source_stage"],
+            "stage_epochs": expected["source_stage_epochs"],
+            **{
+                key: expected[key]
+                for key in ("base_revision", "data_fingerprint", "selection_fingerprint", "lora_fingerprint")
+            },
+        }
         metadata = self.verify(checkpoint, compatible_expected)
         if (
             not self._is_stage_one(metadata["stage"])
             or metadata["boundary"] != 8
             or metadata["epoch"] != metadata["stage_epochs"] - 1
+            or metadata["epoch"] != expected["source_epoch"]
+            or metadata["boundary"] != expected["source_boundary"]
         ):
             raise CheckpointMismatch("stage transition requires the final stage1 boundary checkpoint")
+        self._validate_adapter_keys(checkpoint / self._ADAPTER_FILE, model.state_dict())
         self._load_adapter(model, checkpoint / self._ADAPTER_FILE)
         if progress is not None:
-            target_stage = expected.get("stage", "stage2")
-            if not isinstance(target_stage, str):
-                target_stage = str(target_stage)
-            progress.reset_for_stage(target_stage, sampler_seed=sampler_seed)
+            progress.global_step = metadata["global_step"]
+            progress.reset_for_stage("stage2", sampler_seed=sampler_seed)
         return metadata
 
     def verify(self, checkpoint: Path, expected: Mapping[str, Any]) -> dict[str, Any]:
@@ -209,13 +253,12 @@ class CheckpointManager:
             actual_hash = sha256_file(checkpoint / relative_path)
             if actual_hash != recorded_hash:
                 raise CheckpointError(f"checkpoint piece {relative_path} checksum mismatch")
-        self._require_state_categories(checkpoint)
-
         metadata = self._read_json(metadata_path, "metadata")
         self._validate_metadata(metadata)
         fingerprint_payload = {key: value for key, value in metadata.items() if key != "checkpoint_fingerprint"}
         if metadata["checkpoint_fingerprint"] != fingerprint(fingerprint_payload):
             raise CheckpointError("checkpoint metadata fingerprint mismatch")
+        self._require_exact_state_files(checkpoint, metadata)
         self._verify_expected(metadata, expected)
         self._validate_adapter_keys(adapter_path)
         return metadata
@@ -237,10 +280,11 @@ class CheckpointManager:
 
     def _build_metadata(self, progress: TrainingProgress, supplied: Mapping[str, Any]) -> dict[str, Any]:
         supplied = dict(supplied)
+        supplied.pop("rng_state", None)
         conflicting = self._PROGRESS_FIELDS.intersection(supplied)
         if conflicting:
             raise CheckpointError(f"progress metadata is manager-owned: {sorted(conflicting)}")
-        missing = sorted(self._REQUIRED_METADATA - set(supplied))
+        missing = sorted(self._REQUIRED_SUPPLIED_METADATA - set(supplied))
         if missing:
             raise CheckpointError(f"checkpoint metadata is missing required fields: {missing}")
         value: dict[str, Any] = {
@@ -248,26 +292,58 @@ class CheckpointManager:
             **supplied,
             **{key: item for key, item in progress.state_dict().items() if key != "schema_version"},
         }
-        self._validate_metadata({**value, "checkpoint_fingerprint": "pending"}, check_fingerprint=False)
-        value["checkpoint_fingerprint"] = fingerprint(value)
+        self._validate_metadata(value, require_rng=False, require_fingerprint=False)
         return value
 
-    def _validate_metadata(self, metadata: Mapping[str, Any], *, check_fingerprint: bool = True) -> None:
-        required = self._REQUIRED_METADATA | self._PROGRESS_FIELDS | {"schema_version", "checkpoint_fingerprint"}
+    def _finalize_metadata(self, checkpoint: Path, metadata: Mapping[str, Any]) -> dict[str, Any]:
+        value = dict(metadata)
+        self._require_exact_state_files(checkpoint, value, require_rng_metadata=False)
+        rng_names = self._expected_indexed_files("random_states", ".pkl", value["world_size"], rank_style=True)
+        value["rng_state"] = {
+            "format": "accelerate-1.x",
+            "files": {name: sha256_file(checkpoint / name) for name in sorted(rng_names)},
+        }
+        value["checkpoint_fingerprint"] = fingerprint(value)
+        self._validate_metadata(value)
+        return value
+
+    def _validate_metadata(
+        self,
+        metadata: Mapping[str, Any],
+        *,
+        require_rng: bool = True,
+        require_fingerprint: bool = True,
+    ) -> None:
+        required = self._REQUIRED_SUPPLIED_METADATA | self._PROGRESS_FIELDS | {"schema_version"}
+        if require_rng:
+            required = required | {"rng_state"}
+        if require_fingerprint:
+            required = required | {"checkpoint_fingerprint"}
         missing = sorted(required - set(metadata))
         if missing:
             raise CheckpointError(f"checkpoint metadata is missing required fields: {missing}")
         if metadata["schema_version"] != self._SCHEMA_VERSION:
             raise CheckpointError(f"unsupported checkpoint schema_version: {metadata['schema_version']!r}")
-        for name in ("stage_epochs", "world_size", "microbatch", "accumulation", "global_batch_size"):
+        for name in (
+            "stage_epochs",
+            "world_size",
+            "microbatch",
+            "accumulation",
+            "global_batch_size",
+            "optimizer_steps_per_epoch",
+            "optimizer_count",
+            "scheduler_count",
+            "checkpointable_count",
+        ):
             value = metadata[name]
             if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
                 raise CheckpointError(f"checkpoint metadata {name} must be a positive integer")
         if metadata["global_batch_size"] != metadata["world_size"] * metadata["microbatch"] * metadata["accumulation"]:
             raise CheckpointError("checkpoint metadata global_batch_size is inconsistent")
+        if metadata["checkpointable_count"] != 1:
+            raise CheckpointError("checkpoint metadata checkpointable_count must be exactly one for TrainingProgress")
         progress = TrainingProgress(**{field: metadata[field] for field in self._PROGRESS_FIELDS})
-        if progress.epoch >= metadata["stage_epochs"]:
-            raise CheckpointError("checkpoint metadata epoch is outside stage_epochs")
+        self._validate_progress_geometry(progress, metadata)
         for name in (
             "base_revision",
             "evaluator_revision",
@@ -281,15 +357,22 @@ class CheckpointManager:
                 raise CheckpointError(f"checkpoint metadata {name} must be a non-empty string")
         if metadata["wandb_group"] is not None and not isinstance(metadata["wandb_group"], str):
             raise CheckpointError("checkpoint metadata wandb_group must be a string or null")
-        if not isinstance(metadata["rng_state"], Mapping) or not metadata["rng_state"]:
-            raise CheckpointError("checkpoint metadata rng_state must be a non-empty mapping")
-        if check_fingerprint and not isinstance(metadata["checkpoint_fingerprint"], str):
+        if require_rng:
+            rng_state = metadata["rng_state"]
+            if (
+                not isinstance(rng_state, Mapping)
+                or rng_state.get("format") != "accelerate-1.x"
+                or not isinstance(rng_state.get("files"), Mapping)
+            ):
+                raise CheckpointError("checkpoint metadata rng_state must bind Accelerate RNG files")
+        if require_fingerprint and not isinstance(metadata["checkpoint_fingerprint"], str):
             raise CheckpointError("checkpoint metadata checkpoint_fingerprint must be a string")
 
     def _save_adapter_hook(self, accelerator: Any, model: Any):
         def hook(models: list[Any], weights: list[dict[str, torch.Tensor]], output_dir: str | Path) -> None:
-            source = weights[0] if weights else accelerator.unwrap_model(model).state_dict()
-            adapter = self._adapter_tensors(source)
+            target_state = accelerator.unwrap_model(model).state_dict()
+            source_state = weights[0] if weights else target_state
+            adapter = self._normalized_adapter_tensors(source_state, target_state)
             if accelerator.is_main_process:
                 save_file(adapter, Path(output_dir) / self._ADAPTER_FILE)
             weights.clear()
@@ -304,8 +387,9 @@ class CheckpointManager:
         return hook
 
     def _load_adapter(self, model: Any, adapter_path: Path) -> None:
-        self._validate_adapter_keys(adapter_path)
-        result = model.load_state_dict(load_file(adapter_path, device="cpu"), strict=False)
+        adapter = load_file(adapter_path, device="cpu")
+        self._validate_adapter_keys(adapter_path, model.state_dict(), adapter=adapter)
+        result = model.load_state_dict(adapter, strict=False)
         unexpected = getattr(
             result, "unexpected_keys", result[1] if isinstance(result, tuple) and len(result) > 1 else ()
         )
@@ -325,16 +409,53 @@ class CheckpointManager:
             raise CheckpointError("model state contains no LoRA tensors")
         return adapter
 
-    def _validate_adapter_keys(self, adapter_path: Path) -> None:
+    @classmethod
+    def _normalized_adapter_tensors(
+        cls,
+        source_state: Mapping[str, Any],
+        target_state: Mapping[str, Any],
+    ) -> dict[str, torch.Tensor]:
+        target = cls._adapter_tensors(target_state)
+        normalized: dict[str, torch.Tensor] = {}
+        extra: list[str] = []
+        for source_key, tensor in cls._adapter_tensors(source_state).items():
+            candidate = source_key
+            while candidate not in target and candidate.startswith("module."):
+                candidate = candidate.removeprefix("module.")
+            if candidate not in target:
+                extra.append(source_key)
+                continue
+            if candidate in normalized:
+                raise CheckpointMismatch(f"multiple wrapped LoRA keys normalize to {candidate!r}")
+            normalized[candidate] = tensor
+        missing = sorted(set(target) - set(normalized))
+        if missing or extra:
+            raise CheckpointMismatch(f"model LoRA key mismatch; missing={missing}, extra={sorted(extra)}")
+        return normalized
+
+    def _validate_adapter_keys(
+        self,
+        adapter_path: Path,
+        target_state: Mapping[str, Any] | None = None,
+        *,
+        adapter: Mapping[str, torch.Tensor] | None = None,
+    ) -> None:
         try:
-            keys = set(load_file(adapter_path, device="cpu"))
+            adapter = dict(adapter) if adapter is not None else load_file(adapter_path, device="cpu")
         except Exception as error:
             raise CheckpointError(f"cannot read LoRA adapter: {error}") from error
+        keys = set(adapter)
         if not keys:
             raise CheckpointError("LoRA adapter is empty")
         non_lora = sorted(key for key in keys if "lora_" not in key)
         if non_lora:
             raise CheckpointError(f"adapter contains non-LoRA keys: {non_lora}")
+        if target_state is not None:
+            target_keys = set(self._adapter_tensors(target_state))
+            missing = sorted(target_keys - keys)
+            extra = sorted(keys - target_keys)
+            if missing or extra:
+                raise CheckpointMismatch(f"adapter LoRA key mismatch; missing={missing}, extra={extra}")
 
     def _register_progress(self, accelerator: Any, progress: TrainingProgress) -> None:
         identity = (id(accelerator), id(progress))
@@ -351,18 +472,151 @@ class CheckpointManager:
         }
         atomic_json(checkpoint / self._MANIFEST_FILE, {"schema_version": self._SCHEMA_VERSION, "files": files})
 
-    @staticmethod
-    def _require_state_categories(checkpoint: Path) -> None:
+    def _require_exact_state_files(
+        self,
+        checkpoint: Path,
+        metadata: Mapping[str, Any],
+        *,
+        require_rng_metadata: bool = True,
+    ) -> None:
         filenames = {path.name for path in Path(checkpoint).iterdir() if path.is_file()}
-        categories = {
-            "optimizer": any(name.startswith("optimizer") for name in filenames),
-            "scheduler": any(name.startswith("scheduler") for name in filenames),
-            "RNG": any(name.startswith("random_states") for name in filenames),
-            "registered progress": any(name.startswith("custom_checkpoint") for name in filenames),
+        specifications = {
+            "optimizer": (
+                re.compile(r"^optimizer(?:_\d+)?\.bin$"),
+                self._expected_indexed_files("optimizer", ".bin", metadata["optimizer_count"]),
+            ),
+            "scheduler": (
+                re.compile(r"^scheduler(?:_\d+)?\.bin$"),
+                self._expected_indexed_files("scheduler", ".bin", metadata["scheduler_count"]),
+            ),
+            "registered progress": (
+                re.compile(r"^custom_checkpoint_\d+\.pkl$"),
+                self._expected_indexed_files(
+                    "custom_checkpoint", ".pkl", metadata["checkpointable_count"], rank_style=True
+                ),
+            ),
+            "RNG": (
+                re.compile(r"^random_states_\d+\.pkl$"),
+                self._expected_indexed_files("random_states", ".pkl", metadata["world_size"], rank_style=True),
+            ),
         }
-        missing = [name for name, present in categories.items() if not present]
+        for category, (pattern, expected) in specifications.items():
+            actual = {name for name in filenames if pattern.fullmatch(name)}
+            if actual != expected:
+                raise CheckpointError(
+                    f"checkpoint {category} file set mismatch; missing={sorted(expected - actual)}, "
+                    f"extra={sorted(actual - expected)}"
+                )
+        if require_rng_metadata:
+            rng_files = metadata["rng_state"]["files"]
+            expected_rng = specifications["RNG"][1]
+            if set(rng_files) != expected_rng:
+                raise CheckpointError(
+                    f"checkpoint RNG metadata file set mismatch; missing={sorted(expected_rng - set(rng_files))}, "
+                    f"extra={sorted(set(rng_files) - expected_rng)}"
+                )
+            for name, expected_hash in rng_files.items():
+                if sha256_file(Path(checkpoint) / name) != expected_hash:
+                    raise CheckpointError(f"checkpoint RNG metadata checksum mismatch for {name}")
+
+    @staticmethod
+    def _expected_indexed_files(stem: str, suffix: str, count: int, *, rank_style: bool = False) -> set[str]:
+        if rank_style:
+            return {f"{stem}_{index}{suffix}" for index in range(count)}
+        return {f"{stem}{'' if index == 0 else f'_{index}'}{suffix}" for index in range(count)}
+
+    @staticmethod
+    def _validate_progress_geometry(progress: TrainingProgress, metadata: Mapping[str, Any]) -> None:
+        steps_per_epoch = metadata["optimizer_steps_per_epoch"]
+        if steps_per_epoch < 8:
+            raise CheckpointError("checkpoint metadata optimizer_steps_per_epoch must be at least eight")
+        if progress.epoch >= metadata["stage_epochs"]:
+            raise CheckpointError("checkpoint metadata epoch is outside stage_epochs")
+        epoch_start = progress.epoch * steps_per_epoch
+        epoch_step = progress.optimizer_step - epoch_start
+        if not 1 <= epoch_step <= steps_per_epoch:
+            raise CheckpointError("checkpoint metadata optimizer_step is outside the active epoch")
+        boundaries = tuple((fraction * steps_per_epoch + 7) // 8 for fraction in range(1, 9))
+        reached = sum(step <= epoch_step for step in boundaries)
+        if progress.boundary != reached or progress.optimizer_step != epoch_start + boundaries[reached - 1]:
+            raise CheckpointError(
+                "checkpoint metadata boundary does not match the completed optimizer_step boundary cursor"
+            )
+        expected_microstep = progress.optimizer_step * metadata["accumulation"]
+        if progress.microstep != expected_microstep:
+            raise CheckpointError(
+                f"checkpoint metadata microstep must equal optimizer_step * accumulation ({expected_microstep})"
+            )
+        if progress.sampler_epoch != progress.epoch:
+            raise CheckpointError("checkpoint metadata sampler_epoch must equal epoch")
+        stage_start = metadata["stage_start_global_step"]
+        if not isinstance(stage_start, int) or isinstance(stage_start, bool) or stage_start < 0:
+            raise CheckpointError("checkpoint metadata stage_start_global_step must be a non-negative integer")
+        if progress.global_step != stage_start + progress.optimizer_step:
+            raise CheckpointError("checkpoint metadata global_step is inconsistent with stage-relative optimizer_step")
+        if CheckpointManager._is_stage_one(progress.stage) and stage_start != 0:
+            raise CheckpointError("stage1 checkpoint metadata stage_start_global_step must be zero")
+
+    def _preflight_progress(self, checkpoint: Path, metadata: Mapping[str, Any]) -> None:
+        progress_path = checkpoint / "custom_checkpoint_0.pkl"
+        try:
+            state = torch.load(progress_path, map_location="cpu", weights_only=True)
+        except Exception as error:
+            raise CheckpointError(f"cannot preflight registered progress state: {error}") from error
+        if not isinstance(state, Mapping):
+            raise CheckpointError("registered progress state must be a mapping")
+        expected = {
+            "schema_version": TrainingProgress._SCHEMA_VERSION,
+            **{field: metadata[field] for field in self._PROGRESS_FIELDS},
+        }
+        if dict(state) != expected:
+            raise CheckpointError("registered progress state does not match checkpoint metadata")
+        probe = TrainingProgress(stage=metadata["stage"])
+        try:
+            probe.load_state_dict(state)
+        except (TypeError, ValueError) as error:
+            raise CheckpointError(f"registered progress state is invalid: {error}") from error
+
+    @staticmethod
+    def _assert_progress_matches_metadata(progress: TrainingProgress, metadata: Mapping[str, Any]) -> None:
+        expected = {
+            "schema_version": TrainingProgress._SCHEMA_VERSION,
+            **{field: metadata[field] for field in CheckpointManager._PROGRESS_FIELDS},
+        }
+        if progress.state_dict() != expected:
+            raise CheckpointRestoreError(
+                "Accelerate returned without restoring exact progress; process restart required"
+            )
+
+    @staticmethod
+    def _require_expected_identity(expected: Mapping[str, Any], required: frozenset[str], description: str) -> None:
+        missing = sorted(required - set(expected))
         if missing:
-            raise CheckpointError(f"checkpoint is missing Accelerate state: {', '.join(missing)}")
+            raise CheckpointMismatch(f"{description} is incomplete; missing={missing}")
+
+    def _ensure_usable(self) -> None:
+        if self._poisoned_reason is not None:
+            raise CheckpointRestoreError(
+                f"checkpoint manager is unusable after a partial restore; process restart required: "
+                f"{self._poisoned_reason}"
+            )
+
+    @classmethod
+    def _ensure_supported_accelerator(cls, accelerator: Any) -> None:
+        distributed_type = getattr(accelerator, "distributed_type", None)
+        value = getattr(distributed_type, "value", distributed_type)
+        normalized = str(value).upper()
+        if normalized not in cls._SUPPORTED_DISTRIBUTED_TYPES:
+            raise CheckpointError(
+                f"unsupported Accelerate distributed type {normalized}; "
+                "LoRA-only checkpoints support only NO, MULTI_CPU, and MULTI_GPU"
+            )
+
+    @staticmethod
+    def _validate_accelerator_world_size(accelerator: Any, expected_world_size: int) -> None:
+        actual = getattr(accelerator, "num_processes", getattr(accelerator, "world_size", None))
+        if actual is not None and actual != expected_world_size:
+            raise CheckpointMismatch(f"Accelerate world_size mismatch: expected {expected_world_size}, found {actual}")
 
     @staticmethod
     def _verify_expected(actual: Mapping[str, Any], expected: Mapping[str, Any], prefix: str = "") -> None:
