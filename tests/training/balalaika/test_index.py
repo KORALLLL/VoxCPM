@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import fcntl
 import sqlite3
 
 import pytest
@@ -85,6 +86,27 @@ def test_build_index_rejects_malformed_agreement(synthetic_corpus):
 
     with pytest.raises(IndexIntegrityError, match="malformed agreement"):
         build_index(synthetic_corpus.config, synthetic_corpus.expectations)
+
+
+def test_build_index_rejects_missing_agreement_key_but_accepts_explicit_null(synthetic_corpus):
+    """Catches schema drift being mistaken for the intentional null-agreement exclusion."""
+    audit = build_index(synthetic_corpus.config, synthetic_corpus.expectations)
+    with sqlite3.connect(audit.index_path) as db:
+        assert db.execute("SELECT stage FROM samples WHERE source_relative_path = '000001/c.wav'").fetchone() == (None,)
+
+    synthetic_corpus.remove_agreement("000000/a.wav")
+    with pytest.raises(IndexIntegrityError, match="missing asr_agreement_mean"):
+        build_index(synthetic_corpus.config, synthetic_corpus.expectations)
+
+
+def test_build_index_rejects_concurrent_builder(synthetic_corpus):
+    """Catches a second builder publishing a database/audit pair over an active build."""
+    synthetic_corpus.config.index_dir.mkdir()
+    lock_path = synthetic_corpus.config.index_dir / ".balalaika-index.lock"
+    with lock_path.open("w") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(IndexIntegrityError, match="another index build"):
+            build_index(synthetic_corpus.config, synthetic_corpus.expectations)
 
 
 def test_build_index_rejects_empty_combined_text(synthetic_corpus):

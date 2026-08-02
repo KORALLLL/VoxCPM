@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import fcntl
 import hashlib
 import json
 import math
@@ -23,6 +24,7 @@ _COMBINED_SIDECAR = Path("combined_sidecars/rover-punctuation-stress-v1/rover-pu
 _SOURCE_GLOB = "train/shard_*.tar"
 _AUDIO_SUFFIXES = frozenset({".wav", ".flac", ".mp3", ".ogg", ".opus", ".m4a"})
 _BATCH_SIZE = 10_000
+_BUILD_LOCK_NAME = ".balalaika-index.lock"
 
 
 class IndexIntegrityError(RuntimeError):
@@ -81,15 +83,21 @@ def build_index(config: DataConfig, expectations: BuildExpectations) -> IndexAud
     """Build and atomically publish a strict offset-only SQLite corpus index."""
     corpus_root = Path(config.corpus_root)
     index_dir = Path(config.index_dir)
+    index_dir.mkdir(parents=True, exist_ok=True)
+    with _BuildLock(index_dir / _BUILD_LOCK_NAME):
+        return _build_index_locked(corpus_root, index_dir, expectations)
+
+
+def _build_index_locked(corpus_root: Path, index_dir: Path, expectations: BuildExpectations) -> IndexAudit:
     rover_archive = corpus_root / _ROVER_ARCHIVE
     combined_sidecar = corpus_root / _COMBINED_SIDECAR
     source_tars = sorted(corpus_root.glob(_SOURCE_GLOB))
     _validate_source_inventory(corpus_root, source_tars, expectations)
 
-    index_dir.mkdir(parents=True, exist_ok=True)
     index_path = index_dir / "balalaika-index.sqlite3"
     audit_path = index_dir / "balalaika-index-audit.json"
     temporary_index = _temporary_path(index_dir, index_path.name)
+    temporary_audit = _temporary_path(index_dir, audit_path.name)
     database: sqlite3.Connection | None = None
     try:
         database = sqlite3.connect(temporary_index)
@@ -125,15 +133,15 @@ def build_index(config: DataConfig, expectations: BuildExpectations) -> IndexAud
             "stage2_rows": audit.stage2_rows,
             "excluded_null_agreement": audit.excluded_null_agreement,
         }
-        os.replace(temporary_index, index_path)
-        _fsync_directory(index_dir)
-        atomic_json(audit_path, audit_payload)
-        _fsync_directory(index_dir)
+        atomic_json(temporary_audit, audit_payload)
+        _fsync_file(temporary_audit)
+        _publish_pair(temporary_index, temporary_audit, index_path, audit_path)
         return audit
     except BaseException:
         if database is not None:
             database.close()
         _remove_sqlite_artifacts(temporary_index)
+        temporary_audit.unlink(missing_ok=True)
         raise
 
 
@@ -560,7 +568,9 @@ def _identity_from_row(payload: object, context: str) -> str:
 def _agreement_from_row(payload: object, context: str) -> float | None:
     if not isinstance(payload, dict):
         raise IndexIntegrityError(f"malformed JSON object in {context}")
-    value = payload.get("asr_agreement_mean")
+    if "asr_agreement_mean" not in payload:
+        raise IndexIntegrityError(f"missing asr_agreement_mean in {context}")
+    value = payload["asr_agreement_mean"]
     if value is None:
         return None
     if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -611,6 +621,78 @@ def _temporary_path(directory: Path, basename: str) -> Path:
     temporary_path = Path(temporary)
     temporary_path.unlink()
     return temporary_path
+
+
+class _BuildLock:
+    """A nonblocking process lock that serializes one index publication directory."""
+
+    def __init__(self, path: Path):
+        self._path = path
+        self._descriptor: int | None = None
+
+    def __enter__(self) -> "_BuildLock":
+        self._descriptor = os.open(self._path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(self._descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            os.close(self._descriptor)
+            self._descriptor = None
+            raise IndexIntegrityError("another index build is already active for this index directory") from error
+        return self
+
+    def __exit__(self, _type: object, _value: object, _traceback: object) -> None:
+        if self._descriptor is not None:
+            fcntl.flock(self._descriptor, fcntl.LOCK_UN)
+            os.close(self._descriptor)
+            self._descriptor = None
+
+
+def _publish_pair(temporary_index: Path, temporary_audit: Path, index_path: Path, audit_path: Path) -> None:
+    """Replace the final pair together, rolling back either half on publication failure."""
+    directory = index_path.parent
+    index_backup = _temporary_path(directory, f"{index_path.name}.previous")
+    audit_backup = _temporary_path(directory, f"{audit_path.name}.previous")
+    had_index = index_path.exists()
+    had_audit = audit_path.exists()
+    installed_index = False
+    installed_audit = False
+    try:
+        if had_index:
+            os.replace(index_path, index_backup)
+        if had_audit:
+            os.replace(audit_path, audit_backup)
+        os.replace(temporary_index, index_path)
+        installed_index = True
+        os.replace(temporary_audit, audit_path)
+        installed_audit = True
+        _assert_published_pair_consistent(index_path, audit_path)
+        _fsync_directory(directory)
+    except BaseException:
+        if installed_index:
+            index_path.unlink(missing_ok=True)
+        if installed_audit:
+            audit_path.unlink(missing_ok=True)
+        if had_index and index_backup.exists():
+            os.replace(index_backup, index_path)
+        if had_audit and audit_backup.exists():
+            os.replace(audit_backup, audit_path)
+        _fsync_directory(directory)
+        raise
+    else:
+        index_backup.unlink(missing_ok=True)
+        audit_backup.unlink(missing_ok=True)
+        _fsync_directory(directory)
+
+
+def _assert_published_pair_consistent(index_path: Path, audit_path: Path) -> None:
+    try:
+        audit = json.loads(audit_path.read_text(encoding="utf-8"))
+        with sqlite3.connect(index_path) as database:
+            row = database.execute("SELECT value FROM metadata WHERE key = 'fingerprint'").fetchone()
+    except (OSError, sqlite3.Error, json.JSONDecodeError) as error:
+        raise IndexIntegrityError("cannot verify published index/audit pair") from error
+    if not isinstance(audit, dict) or not isinstance(audit.get("fingerprint"), str) or row != (audit["fingerprint"],):
+        raise IndexIntegrityError("published index/audit pair fingerprint mismatch")
 
 
 def _fsync_file(path: Path) -> None:

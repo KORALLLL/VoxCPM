@@ -82,6 +82,12 @@ class SyntheticCorpus:
         self._write_rover()
         self._refresh_hashes()
 
+    def remove_agreement(self, identity: str) -> None:
+        row = next(row for row in self.rover_rows if row["source_relative_path"] == identity)
+        row.pop("asr_agreement_mean")
+        self._write_rover()
+        self._refresh_hashes()
+
     def remove_rover_shard(self, shard: str) -> None:
         self.rover_rows = [
             row for row in self.rover_rows if not str(row["source_relative_path"]).startswith(f"{shard}/")
