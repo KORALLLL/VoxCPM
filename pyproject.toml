@@ -62,6 +62,13 @@ dev = [
 timestamps = [
     "stable-ts>=2.19.1",
 ]
+balalaika = [
+    "accelerate>=1.10,<2",
+    "wandb>=0.21,<1",
+    "zstandard>=0.23,<1",
+    "onnx-asr[gpu,hub]",
+    "pyyaml>=6,<7",
+]
 
 [project.scripts]
 voxcpm = "voxcpm.cli:main"
