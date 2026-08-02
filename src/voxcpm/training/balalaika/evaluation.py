@@ -10,7 +10,7 @@ import math
 import os
 from pathlib import Path
 import shutil
-from tempfile import NamedTemporaryFile
+from tempfile import NamedTemporaryFile, mkdtemp
 import time
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
@@ -44,6 +44,41 @@ class _RunContext:
     input_fingerprint: str
     item_inputs: Mapping[int, Mapping[str, object]]
     item_seeds: Mapping[int, int]
+
+
+@dataclass(frozen=True)
+class _RNGState:
+    cpu: torch.Tensor
+    cuda_device: torch.device | None
+    cuda: torch.Tensor | None
+
+
+@dataclass(frozen=True)
+class _RetentionCandidate:
+    boundary_dir: Path
+    record: Mapping[str, object]
+    audio: tuple[Mapping[str, object], ...]
+    ordering_key: tuple[int, str, str]
+    source_wavs_exist: bool
+
+
+_COMPLETION_KEYS = frozenset(
+    {
+        "version",
+        "status",
+        "input_fingerprint",
+        "selection_fingerprint",
+        "checkpoint_fingerprint",
+        "boundary",
+        "item_count",
+        "artifacts",
+        "audio",
+        "snapshot_fingerprint",
+        "published_at",
+    }
+)
+_AUDIO_KEYS = frozenset({"id", "source_path", "retained_path", "sha256"})
+_ITEM_SNAPSHOT_KEYS = frozenset({"row", "score", "prompt_id", "asr_hypothesis", "wav_path", "wav_sha256"})
 
 
 def partition_ids(ids: Iterable[int], *, rank: int, world_size: int) -> tuple[int, ...]:
@@ -172,6 +207,7 @@ class DistributedEvaluator:
         vae_training = _training_mode(audio_vae)
         had_audio_vae = hasattr(unwrapped, "audio_vae")
         previous_audio_vae = getattr(unwrapped, "audio_vae", None)
+        rng_state = _capture_rng(self.runtime)
         claims: dict[int, ValidationClaim] = {}
         try:
             _set_training(unwrapped, False)
@@ -186,6 +222,7 @@ class DistributedEvaluator:
             _restore_audio_vae(unwrapped, had_audio_vae, previous_audio_vae)
             _restore_training(audio_vae, vae_training)
             _restore_training(unwrapped, model_training)
+            _restore_rng(rng_state)
         return {
             item_id
             for item_id in local_ids
@@ -285,11 +322,45 @@ class DistributedEvaluator:
         context = self._context(checkpoint, boundary)
         completion_path = self.ledger.root / "validation-complete.json"
         if completion_path.is_file():
-            record = self._verify_completion(context, require_retained=False)
+            status_path = self.ledger.root / "resume-retention-status.json"
             if self.runtime.rank == 0:
-                self._apply_retention()
+                try:
+                    record = self._verify_completion(context, require_retained=False)
+                    self._apply_retention()
+                    status = {
+                        "version": 1,
+                        "status": "success",
+                        "input_fingerprint": context.input_fingerprint,
+                        "completion_snapshot_fingerprint": record["snapshot_fingerprint"],
+                    }
+                except Exception as error:
+                    status = {
+                        "version": 1,
+                        "status": "failed",
+                        "input_fingerprint": context.input_fingerprint,
+                        "error": _error_snapshot(error),
+                    }
+                atomic_json(status_path, status)
             self.runtime.barrier()
-            self._verify_completion(context, require_retained=True)
+            status = _read_json(status_path, "resume retention status")
+            if status.get("input_fingerprint") != context.input_fingerprint:
+                raise EvaluationIntegrityError(f"Resume retention status belongs to different inputs: {status_path}")
+            if status.get("version") != 1 or status.get("status") not in {"success", "failed"}:
+                raise EvaluationIntegrityError(f"Resume retention status is malformed: {status_path}")
+            if status["status"] == "failed":
+                if set(status) != {"version", "status", "input_fingerprint", "error"}:
+                    raise EvaluationIntegrityError(f"Resume retention failure status is malformed: {status_path}")
+                _raise_error_snapshot(_mapping(status.get("error"), "resume retention error"))
+            if set(status) != {
+                "version",
+                "status",
+                "input_fingerprint",
+                "completion_snapshot_fingerprint",
+            }:
+                raise EvaluationIntegrityError(f"Resume retention success status is malformed: {status_path}")
+            record = self._verify_completion(context, require_retained=True)
+            if status["completion_snapshot_fingerprint"] != record["snapshot_fingerprint"]:
+                raise EvaluationIntegrityError(f"Resume retention completion identity changed: {status_path}")
             return self._payload_from_artifacts(context, record)
 
         local_status_path = self.ledger.root / "rank-status" / f"rank-{self.runtime.rank:02d}.json"
@@ -403,10 +474,10 @@ class DistributedEvaluator:
                 seed = context.item_seeds[item_id]
                 claim = claims.pop(item_id, None)
                 while not self.ledger.is_complete(item_id, inputs=inputs, attempt_seed=seed):
+                    replacement = self.ledger.claim(item_id, rank=self.runtime.rank, inputs=inputs, attempt_seed=seed)
+                    claim = replacement if replacement is not None else claim
                     if claim is None:
-                        claim = self.ledger.claim(item_id, rank=self.runtime.rank, inputs=inputs, attempt_seed=seed)
-                    if claim is None:
-                        break
+                        raise EvaluationIntegrityError(f"No live validation claim is available for ASR item {item_id}")
                     record = self._item_record(item_id)
                     generation = _mapping(record.get("generation"), "generation")
                     if generation.get("status") != "success":
@@ -647,73 +718,246 @@ class DistributedEvaluator:
         )
 
     def _apply_retention(self) -> None:
-        completed: list[tuple[int, str, Path, dict[str, object]]] = []
         if not self.validation_root.is_dir():
             return
+        completed: list[_RetentionCandidate] = []
         for boundary_dir in sorted(self.validation_root.iterdir()):
             if not boundary_dir.is_dir() or boundary_dir.name == "retained-audio":
                 continue
             completion_path = boundary_dir / "validation-complete.json"
             if not completion_path.is_file():
                 continue
-            record = _read_json(completion_path, "retention completion")
-            if record.get("status") != "complete" or not isinstance(record.get("audio"), list):
-                raise EvaluationIntegrityError(f"Cannot retain malformed completed boundary: {completion_path}")
-            boundary = _mapping(record.get("boundary"), "retention boundary")
-            global_step = boundary.get("global_step")
-            if isinstance(global_step, bool) or not isinstance(global_step, int) or global_step < 0:
-                raise EvaluationIntegrityError(f"Completed boundary has invalid global step: {completion_path}")
-            self._retain_boundary_audio(boundary_dir, record)
-            completed.append((global_step, str(record.get("published_at", "")), boundary_dir, record))
+            completed.append(self._validate_retention_completion(boundary_dir))
         if not completed:
             return
-        latest = max(completed, key=lambda value: (value[0], value[1], value[2].name))[2]
-        for _, _, boundary_dir, _ in completed:
-            wavs = boundary_dir / "wavs"
-            if boundary_dir != latest and wavs.exists():
+
+        staged: list[tuple[_RetentionCandidate, Path]] = []
+        try:
+            for candidate in completed:
+                retained_dir = self._retained_dir(candidate.boundary_dir)
+                if retained_dir.is_symlink():
+                    raise EvaluationIntegrityError(f"Retained validation boundary is unsafe: {retained_dir}")
+                if retained_dir.exists():
+                    self._validate_retained_boundary(candidate, retained_dir)
+                    continue
+                staged.append((candidate, self._stage_retained_boundary(candidate)))
+            for candidate, staging_dir in staged:
+                retained_dir = self._retained_dir(candidate.boundary_dir)
+                if retained_dir.exists() or retained_dir.is_symlink():
+                    raise EvaluationIntegrityError(
+                        f"Retained validation boundary appeared concurrently: {retained_dir}"
+                    )
+                os.replace(staging_dir, retained_dir)
+                _fsync_directory(retained_dir.parent)
+            for candidate in completed:
+                self._validate_retained_boundary(candidate, self._retained_dir(candidate.boundary_dir))
+        finally:
+            for _, staging_dir in staged:
+                if staging_dir.exists():
+                    shutil.rmtree(staging_dir)
+
+        latest = max(completed, key=lambda candidate: candidate.ordering_key).boundary_dir
+        for candidate in completed:
+            wavs = candidate.boundary_dir / "wavs"
+            if candidate.boundary_dir != latest and wavs.exists():
                 if wavs.is_symlink() or not wavs.is_dir():
                     raise EvaluationIntegrityError(f"Validation WAV retention target is unsafe: {wavs}")
                 shutil.rmtree(wavs)
 
-    def _retain_boundary_audio(self, boundary_dir: Path, completion: Mapping[str, object]) -> None:
-        for item in completion["audio"]:
-            if not isinstance(item, Mapping):
-                raise EvaluationIntegrityError(f"Completed boundary audio record is malformed: {boundary_dir}")
-            item_id = item.get("id")
-            if isinstance(item_id, bool) or not isinstance(item_id, int):
-                raise EvaluationIntegrityError(f"Completed boundary audio ID is malformed: {boundary_dir}")
-            source = Path(str(item.get("source_path")))
-            retained = Path(str(item.get("retained_path")))
-            expected_retained = self.validation_root / "retained-audio" / boundary_dir.name / f"{item_id:05d}.wav"
+    def _validate_retention_completion(self, boundary_dir: Path) -> _RetentionCandidate:
+        completion_path = boundary_dir / "validation-complete.json"
+        record = _read_json(completion_path, "retention completion")
+        if set(record) != _COMPLETION_KEYS:
+            raise EvaluationIntegrityError(f"Completed validation has an invalid schema: {completion_path}")
+        if record.get("version") != 1 or record.get("status") != "complete":
+            raise EvaluationIntegrityError(f"Completed validation has an invalid identity: {completion_path}")
+        for name in ("input_fingerprint", "selection_fingerprint", "checkpoint_fingerprint", "published_at"):
+            if not isinstance(record.get(name), str) or not record[name]:
+                raise EvaluationIntegrityError(f"Completed validation has an invalid {name}: {completion_path}")
+        if record["selection_fingerprint"] != str(getattr(self.selection, "fingerprint")):
+            raise EvaluationIntegrityError(f"Completed validation selection identity changed: {completion_path}")
+        if record.get("item_count") != self.expected_item_count:
+            raise EvaluationIntegrityError(f"Completed validation item count changed: {completion_path}")
+        boundary_record = _mapping(record.get("boundary"), "retention boundary")
+        if set(boundary_record) != {"stage", "epoch", "boundary", "global_step", "stage_progress"}:
+            raise EvaluationIntegrityError(f"Completed validation boundary schema changed: {completion_path}")
+        normalized_boundary = _boundary_value(boundary_record)
+        if normalized_boundary != boundary_record:
+            raise EvaluationIntegrityError(f"Completed validation boundary identity changed: {completion_path}")
+        canonical = {key: value for key, value in record.items() if key not in {"snapshot_fingerprint", "published_at"}}
+        if record.get("snapshot_fingerprint") != fingerprint(canonical):
+            raise EvaluationIntegrityError(f"Completed validation snapshot fingerprint changed: {completion_path}")
+
+        artifacts = _mapping(record.get("artifacts"), "retention artifacts")
+        if set(artifacts) != {"metrics.json", "items.jsonl"}:
+            raise EvaluationIntegrityError(f"Completed validation artifact schema changed: {completion_path}")
+        for name, expected_hash in artifacts.items():
+            artifact = boundary_dir / name
+            if not isinstance(expected_hash, str) or not artifact.is_file() or sha256_file(artifact) != expected_hash:
+                raise EvaluationIntegrityError(f"Completed validation {name} content changed: {artifact}")
+
+        snapshots = _read_item_snapshots(boundary_dir / "items.jsonl", self.expected_item_count)
+        items: list[ValidationItem] = []
+        item_audio: dict[int, tuple[Path, str]] = {}
+        wav_dir = boundary_dir / "wavs"
+        if wav_dir.is_symlink():
+            raise EvaluationIntegrityError(f"Completed validation WAV tree is unsafe: {wav_dir}")
+        source_wavs_exist = wav_dir.exists()
+        if source_wavs_exist and not wav_dir.is_dir():
+            raise EvaluationIntegrityError(f"Completed validation WAV tree is unsafe: {wav_dir}")
+        wav_root = wav_dir.resolve()
+        for snapshot in snapshots:
+            if not isinstance(snapshot, Mapping) or set(snapshot) != _ITEM_SNAPSHOT_KEYS:
+                raise EvaluationIntegrityError(f"Completed validation item snapshot schema changed: {completion_path}")
+            row = BenchmarkRow(**_mapping(snapshot.get("row"), "retention item row"))
+            score_value = dict(_mapping(snapshot.get("score"), "retention item score"))
+            score_value["gold_number_span"] = tuple(score_value["gold_number_span"])
+            score_value["hypothesis_number_span"] = tuple(score_value["hypothesis_number_span"])
+            hypothesis = snapshot.get("asr_hypothesis")
+            prompt_id = snapshot.get("prompt_id")
+            if not isinstance(hypothesis, str) or not isinstance(prompt_id, str) or not prompt_id:
+                raise EvaluationIntegrityError(f"Completed validation item text identity changed: {completion_path}")
+            item = ValidationItem(
+                row=row,
+                score=ItemScore(**score_value),
+                prompt_id=prompt_id,
+                asr_hypothesis=hypothesis,
+            )
+            if row.id in item_audio:
+                raise EvaluationIntegrityError(f"Completed validation item IDs are not unique: {completion_path}")
+            source = Path(str(snapshot.get("wav_path")))
+            expected_hash = snapshot.get("wav_sha256")
+            if not isinstance(expected_hash, str):
+                raise EvaluationIntegrityError(f"Completed validation item WAV hash changed: {completion_path}")
             try:
-                source.relative_to(boundary_dir / "wavs")
+                source.resolve().relative_to(wav_root)
             except ValueError as error:
                 raise EvaluationIntegrityError(
-                    f"Completed boundary audio escapes its WAV directory: {source}"
+                    f"Completed validation source audio escapes WAV tree: {source}"
                 ) from error
-            if retained != expected_retained:
-                raise EvaluationIntegrityError(f"Completed boundary retained-audio path changed: {retained}")
-            expected_hash = item.get("sha256")
-            if retained.is_file() and sha256_file(retained) == expected_hash:
-                continue
-            if not source.is_file() or not isinstance(expected_hash, str) or sha256_file(source) != expected_hash:
-                raise EvaluationIntegrityError(f"Completed boundary source audio content changed: {source}")
-            _atomic_copy(source, retained)
-            if sha256_file(retained) != expected_hash:
-                raise EvaluationIntegrityError(f"Retained boundary audio copy changed: {retained}")
+            if source_wavs_exist and (
+                source.is_symlink() or not source.is_file() or sha256_file(source) != expected_hash
+            ):
+                raise EvaluationIntegrityError(f"Completed validation source audio content changed: {source}")
+            item_audio[row.id] = (source, expected_hash)
+            items.append(item)
+        if len(item_audio) != self.expected_item_count or len({value[0] for value in item_audio.values()}) != len(
+            item_audio
+        ):
+            raise EvaluationIntegrityError(f"Completed validation WAV identities are not exact: {completion_path}")
+        self._validate_retention_metrics(boundary_dir, record, items)
+
+        audio_value = record.get("audio")
+        if not isinstance(audio_value, list) or len(audio_value) != 4:
+            raise EvaluationIntegrityError(
+                f"Completed validation must retain exactly four audio entries: {completion_path}"
+            )
+        audio = tuple(audio_value)
+        expected_ids = tuple(getattr(self.selection, "audio_log_ids"))
+        if tuple(item.get("id") for item in audio if isinstance(item, Mapping)) != expected_ids:
+            raise EvaluationIntegrityError(f"Completed validation fixed audio order changed: {completion_path}")
+        if len({item_id for item_id in expected_ids}) != 4:
+            raise EvaluationIntegrityError(f"Completed validation fixed audio IDs are not unique: {completion_path}")
+        for item in audio:
+            if not isinstance(item, Mapping) or set(item) != _AUDIO_KEYS:
+                raise EvaluationIntegrityError(f"Completed validation audio schema changed: {completion_path}")
+            item_id = item["id"]
+            source, expected_hash = item_audio[item_id]
+            retained = Path(str(item["retained_path"]))
+            if Path(str(item["source_path"])) != source or item.get("sha256") != expected_hash:
+                raise EvaluationIntegrityError(f"Completed validation audio identity changed: {completion_path}")
+            if retained != self._retained_dir(boundary_dir) / f"{item_id:05d}.wav":
+                raise EvaluationIntegrityError(f"Completed validation retained-audio path changed: {retained}")
+
+        candidate = _RetentionCandidate(
+            boundary_dir=boundary_dir,
+            record=MappingProxyType(record),
+            audio=audio,
+            ordering_key=(
+                int(normalized_boundary["global_step"]),
+                str(record["published_at"]),
+                boundary_dir.name,
+            ),
+            source_wavs_exist=source_wavs_exist,
+        )
+        if not source_wavs_exist:
+            self._validate_retained_boundary(candidate, self._retained_dir(boundary_dir))
+        return candidate
+
+    def _validate_retention_metrics(
+        self, boundary_dir: Path, completion: Mapping[str, object], items: Sequence[ValidationItem]
+    ) -> None:
+        metrics_record = _read_json(boundary_dir / "metrics.json", "retention metrics")
+        if metrics_record.get("input_fingerprint") != completion["input_fingerprint"]:
+            raise EvaluationIntegrityError(f"Completed validation metrics identity changed: {boundary_dir}")
+        recomputed = aggregate_scores([item.score for item in items])
+        if dict(_mapping(metrics_record.get("metrics"), "retention aggregate metrics")) != _aggregate_snapshot(
+            recomputed
+        ):
+            raise EvaluationIntegrityError(f"Completed validation aggregate metrics changed: {boundary_dir}")
+        categories = _mapping(metrics_record.get("category_metrics"), "retention category metrics")
+        expected_categories = {
+            category: _aggregate_snapshot(value) for category, value in recomputed.category_metrics.items()
+        }
+        if dict(categories) != expected_categories:
+            raise EvaluationIntegrityError(f"Completed validation category metrics changed: {boundary_dir}")
+
+    def _retained_dir(self, boundary_dir: Path) -> Path:
+        return self.validation_root / "retained-audio" / boundary_dir.name
+
+    def _stage_retained_boundary(self, candidate: _RetentionCandidate) -> Path:
+        if not candidate.source_wavs_exist:
+            raise EvaluationIntegrityError(
+                f"Completed validation has neither source nor retained audio: {candidate.boundary_dir}"
+            )
+        retained_parent = self.validation_root / "retained-audio"
+        retained_parent.mkdir(parents=True, exist_ok=True)
+        staging_dir = Path(mkdtemp(prefix=f".{candidate.boundary_dir.name}.", suffix=".stage", dir=retained_parent))
+        try:
+            for item in candidate.audio:
+                item_id = int(item["id"])
+                _atomic_copy(Path(str(item["source_path"])), staging_dir / f"{item_id:05d}.wav")
+            atomic_json(staging_dir / "retention-complete.json", self._retention_manifest(candidate))
+            self._validate_retained_boundary(candidate, staging_dir)
+            return staging_dir
+        except BaseException:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            raise
+
+    def _retention_manifest(self, candidate: _RetentionCandidate) -> dict[str, object]:
+        identity = {
+            "version": 1,
+            "completion_snapshot_fingerprint": candidate.record["snapshot_fingerprint"],
+            "audio": [
+                {"id": item["id"], "name": f"{int(item['id']):05d}.wav", "sha256": item["sha256"]}
+                for item in candidate.audio
+            ],
+        }
+        return {**identity, "manifest_fingerprint": fingerprint(identity)}
+
+    def _validate_retained_boundary(self, candidate: _RetentionCandidate, retained_dir: Path) -> None:
+        if not retained_dir.is_dir() or retained_dir.is_symlink():
+            raise EvaluationIntegrityError(f"Retained validation boundary is unavailable: {retained_dir}")
+        expected_names = {*(f"{int(item['id']):05d}.wav" for item in candidate.audio), "retention-complete.json"}
+        entries = tuple(retained_dir.iterdir())
+        actual_names = {path.name for path in entries}
+        if actual_names != expected_names or any(path.is_symlink() or not path.is_file() for path in entries):
+            raise EvaluationIntegrityError(f"Retained validation boundary file set changed: {retained_dir}")
+        manifest = _read_json(retained_dir / "retention-complete.json", "retention manifest")
+        expected_manifest = self._retention_manifest(candidate)
+        if manifest != expected_manifest:
+            raise EvaluationIntegrityError(f"Retained validation manifest changed: {retained_dir}")
+        for item in candidate.audio:
+            path = retained_dir / f"{int(item['id']):05d}.wav"
+            if sha256_file(path) != item["sha256"]:
+                raise EvaluationIntegrityError(f"Retained validation audio content changed: {path}")
 
     def _raise_published_failure(self, context: _RunContext) -> None:
         path = self.ledger.root / "validation-failed.json"
         record = _read_json(path, "validation failure")
         if record.get("input_fingerprint") != context.input_fingerprint:
             raise EvaluationIntegrityError(f"Validation failure record belongs to different inputs: {path}")
-        error = _mapping(record.get("error"), "validation failure error")
-        message = str(error.get("message", "validation failed"))
-        if error.get("type") == "IncompleteValidation":
-            raise IncompleteValidation(message)
-        if error.get("type") == "EvaluationIntegrityError":
-            raise EvaluationIntegrityError(message)
-        raise RuntimeError(message)
+        _raise_error_snapshot(_mapping(record.get("error"), "validation failure error"))
 
 
 def _checkpoint_fingerprint(checkpoint: object) -> str:
@@ -912,6 +1156,20 @@ def _device_id(runtime: Any) -> int:
     return int(index if index is not None else runtime.rank)
 
 
+def _capture_rng(runtime: Any) -> _RNGState:
+    device = getattr(runtime, "device", None)
+    cuda_device = torch.device(device) if isinstance(device, torch.device) and device.type == "cuda" else None
+    cpu_state = torch.get_rng_state().clone()
+    cuda_state = torch.cuda.get_rng_state(cuda_device).clone() if cuda_device is not None else None
+    return _RNGState(cpu=cpu_state, cuda_device=cuda_device, cuda=cuda_state)
+
+
+def _restore_rng(state: _RNGState) -> None:
+    torch.set_rng_state(state.cpu)
+    if state.cuda_device is not None and state.cuda is not None:
+        torch.cuda.set_rng_state(state.cuda, state.cuda_device)
+
+
 def _mapping(value: object, label: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         raise EvaluationIntegrityError(f"{label} must be a mapping")
@@ -942,8 +1200,28 @@ def _read_json(path: Path, label: str) -> dict[str, object]:
     return value
 
 
+def _read_item_snapshots(path: Path, expected_count: int) -> list[Mapping[str, object]]:
+    try:
+        with path.open("r", encoding="utf-8") as stream:
+            values = [json.loads(line) for line in stream if line.strip()]
+    except (OSError, json.JSONDecodeError) as error:
+        raise EvaluationIntegrityError(f"Completed validation items are unreadable: {path}") from error
+    if len(values) != expected_count or any(not isinstance(value, Mapping) for value in values):
+        raise EvaluationIntegrityError(f"Completed validation items have the wrong cardinality: {path}")
+    return values
+
+
 def _error_snapshot(error: Exception) -> dict[str, str]:
     return {"type": type(error).__name__, "message": str(error)}
+
+
+def _raise_error_snapshot(error: Mapping[str, object]) -> None:
+    message = str(error.get("message", "validation failed"))
+    if error.get("type") == "IncompleteValidation":
+        raise IncompleteValidation(message)
+    if error.get("type") == "EvaluationIntegrityError":
+        raise EvaluationIntegrityError(message)
+    raise RuntimeError(message)
 
 
 def _timestamp() -> str:
