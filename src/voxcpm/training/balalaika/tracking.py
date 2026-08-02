@@ -13,8 +13,8 @@ from types import MappingProxyType
 from typing import Any
 from uuid import uuid4
 
-from .artifacts import atomic_json, fingerprint
-from .metrics import AggregateScore, BenchmarkRow, ItemScore
+from .artifacts import atomic_json, fingerprint, sha256_file
+from .metrics import AggregateScore, BenchmarkRow, ItemScore, aggregate_scores, normalize_ru
 
 _BOUNDARY_ITEM_COUNT = 2_000
 _AUDIO_EXAMPLE_COUNT = 4
@@ -88,6 +88,9 @@ class ValidationPayload:
     failure_counts: Mapping[str, int] = field(default_factory=dict)
     stage_progress: float = 0.0
     input_fingerprint: str = ""
+    expected_audio_ids: Sequence[int] = ()
+    selection_fingerprint: str = ""
+    audio_sha256: Mapping[int, str] = field(init=False)
 
     def __post_init__(self) -> None:
         materialized_items = tuple(self.items)
@@ -99,23 +102,44 @@ class ValidationPayload:
             raise ValueError("Validation payload item IDs must be unique.")
         if any(not isinstance(item, ValidationItem) for item in materialized_items):
             raise TypeError("Validation payload items must be ValidationItem instances.")
+        if any(normalize_ru(item.row.normalized_gold) != item.score.normalized_gold for item in materialized_items):
+            raise ValueError("Validation item normalized gold must match its score normalized gold.")
+        recomputed_metrics = aggregate_scores([item.score for item in materialized_items])
+        _require_matching_aggregate(self.metrics, recomputed_metrics, "Validation aggregate metrics")
 
+        expected_audio_ids = tuple(self.expected_audio_ids)
+        if len(expected_audio_ids) != _AUDIO_EXAMPLE_COUNT or len(set(expected_audio_ids)) != _AUDIO_EXAMPLE_COUNT:
+            raise ValueError("Validation payload must carry exactly four unique ordered expected audio IDs.")
+        if any(isinstance(item_id, bool) or not isinstance(item_id, int) for item_id in expected_audio_ids):
+            raise TypeError("Validation expected audio IDs must be integers.")
         normalized_audio = {int(item_id): Path(path) for item_id, path in self.audio_paths.items()}
         if len(normalized_audio) != _AUDIO_EXAMPLE_COUNT:
             raise ValueError(
                 f"Validation payload must contain exactly four audio examples, not {len(normalized_audio)}."
             )
+        if tuple(normalized_audio) != expected_audio_ids:
+            raise ValueError("Validation audio mapping keys must equal the ordered expected audio IDs.")
         item_ids = {item.row.id for item in materialized_items}
-        if set(normalized_audio) - item_ids:
+        if set(expected_audio_ids) - item_ids:
             raise ValueError("Validation audio IDs must identify payload items.")
         if any(not path.is_file() for path in normalized_audio.values()):
             raise FileNotFoundError("Validation audio examples must be local WAV files before logging.")
+        if any(path.suffix.lower() != ".wav" for path in normalized_audio.values()):
+            raise ValueError("Validation audio examples must be WAV files before logging.")
+        if not isinstance(self.selection_fingerprint, str) or not self.selection_fingerprint:
+            raise ValueError("Validation selection_fingerprint must be a non-empty string.")
 
         normalized_categories = {str(key): value for key, value in self.category_metrics.items()}
         if set(normalized_categories) != {item.row.category for item in materialized_items}:
             raise ValueError("Validation category metrics must cover exactly the scored item categories.")
         if any(value.item_count <= 0 for value in normalized_categories.values()):
             raise ValueError("Validation category metrics must have positive item counts.")
+        for category, actual in normalized_categories.items():
+            _require_matching_aggregate(
+                actual,
+                recomputed_metrics.category_metrics[category],
+                f"Validation category metrics for {category}",
+            )
         normalized_timings = _normalize_nonnegative_float_mapping(self.timings, "timings")
         normalized_failures = _normalize_nonnegative_int_mapping(self.failure_counts, "failure_counts")
         if not isinstance(self.stage_progress, (int, float)) or not math.isfinite(self.stage_progress):
@@ -127,6 +151,10 @@ class ValidationPayload:
 
         object.__setattr__(self, "items", materialized_items)
         object.__setattr__(self, "audio_paths", MappingProxyType(normalized_audio))
+        object.__setattr__(
+            self, "audio_sha256", MappingProxyType({key: sha256_file(path) for key, path in normalized_audio.items()})
+        )
+        object.__setattr__(self, "expected_audio_ids", expected_audio_ids)
         object.__setattr__(self, "artifact_dir", Path(self.artifact_dir))
         object.__setattr__(self, "category_metrics", MappingProxyType(normalized_categories))
         object.__setattr__(self, "timings", MappingProxyType(normalized_timings))
@@ -220,20 +248,38 @@ class WandbRunManager:
             raise TypeError("log_validation requires a ValidationPayload.")
         selected_audio = _selected_audio_paths(result, audio_paths)
         boundary_path = self._boundary_path(result.artifact_dir, global_step)
+        snapshot_path = self._snapshot_path(result.artifact_dir, global_step)
+        snapshot = self._boundary_snapshot(result, selected_audio, global_step)
+        snapshot_fingerprint = fingerprint(snapshot)
         if _is_completed_boundary(
             boundary_path,
+            snapshot_path=snapshot_path,
             run_id=self.run_id,
             config_fingerprint=self._settings.config_fingerprint,
             input_fingerprint=result.input_fingerprint or _payload_input_fingerprint(result),
+            snapshot_fingerprint=snapshot_fingerprint,
         ):
             return
-        pending = self._boundary_record(result, selected_audio, global_step, status="pending")
+        _require_matching_pending_boundary(
+            boundary_path,
+            snapshot_path=snapshot_path,
+            run_id=self.run_id,
+            config_fingerprint=self._settings.config_fingerprint,
+            input_fingerprint=result.input_fingerprint or _payload_input_fingerprint(result),
+            snapshot_fingerprint=snapshot_fingerprint,
+        )
+        _write_and_validate_snapshot(snapshot_path, snapshot, snapshot_fingerprint)
+        pending = self._boundary_record(result, global_step, snapshot_path, snapshot_fingerprint, status="pending")
         atomic_json(boundary_path, pending)
 
         payload = self._validation_log_payload(result, selected_audio, global_step)
         self._run.log(payload, step=int(global_step))
         _fsync_directory(_run_directory(self._run))
-        atomic_json(boundary_path, self._boundary_record(result, selected_audio, global_step, status="complete"))
+        _validate_snapshot(snapshot_path, snapshot_fingerprint)
+        atomic_json(
+            boundary_path,
+            self._boundary_record(result, global_step, snapshot_path, snapshot_fingerprint, status="complete"),
+        )
 
     def finish(self) -> None:
         """Finish this rank-zero run once, after all successfully logged boundaries."""
@@ -274,17 +320,40 @@ class WandbRunManager:
     def _boundary_path(self, artifact_dir: Path, global_step: int) -> Path:
         return artifact_dir / "wandb-boundaries" / f"{self.job_type}-step-{int(global_step):09d}.json"
 
+    def _snapshot_path(self, artifact_dir: Path, global_step: int) -> Path:
+        return artifact_dir / "wandb-boundaries" / f"{self.job_type}-step-{int(global_step):09d}.snapshot.json"
+
     def _boundary_record(
         self,
         result: ValidationPayload,
-        audio_paths: Mapping[int, Path],
         global_step: int,
+        snapshot_path: Path,
+        snapshot_fingerprint: str,
         *,
         status: str,
     ) -> dict[str, object]:
         return {
             "version": 1,
             "status": status,
+            "job_type": self.job_type,
+            "run_id": self.run_id,
+            "mode": self._settings.mode,
+            "global_step": int(global_step),
+            "stage_progress": result.stage_progress,
+            "config_fingerprint": self._settings.config_fingerprint,
+            "input_fingerprint": result.input_fingerprint or _payload_input_fingerprint(result),
+            "snapshot_path": snapshot_path.name,
+            "snapshot_fingerprint": snapshot_fingerprint,
+        }
+
+    def _boundary_snapshot(
+        self,
+        result: ValidationPayload,
+        audio_paths: Mapping[int, Path],
+        global_step: int,
+    ) -> dict[str, object]:
+        return {
+            "version": 1,
             "job_type": self.job_type,
             "run_id": self.run_id,
             "mode": self._settings.mode,
@@ -299,8 +368,12 @@ class WandbRunManager:
             },
             "timings": dict(result.timings),
             "failure_counts": dict(result.failure_counts),
-            "item_ids": [item.row.id for item in result.items],
-            "audio": [{"id": item_id, "path": str(path)} for item_id, path in audio_paths.items()],
+            "selection": {
+                "audio_ids": list(result.expected_audio_ids),
+                "fingerprint": result.selection_fingerprint,
+            },
+            "table": {"columns": list(_TABLE_COLUMNS), "rows": _table_data(result.items)},
+            "audio": _snapshot_audio(result, audio_paths),
         }
 
 
@@ -378,6 +451,8 @@ def _load_or_create_run_id(path: Path, job_type: str, config_fingerprint: str) -
             raise RuntimeError(f"W&B run state is unreadable: {path}") from error
         if not isinstance(state, dict) or state.get("job_type") != job_type:
             raise RuntimeError(f"W&B run state does not belong to {job_type}: {path}")
+        if state.get("config_fingerprint") != config_fingerprint:
+            raise RuntimeError(f"W&B run state config fingerprint does not match the current configuration: {path}")
         run_id = state.get("run_id")
         if not isinstance(run_id, str) or not run_id:
             raise RuntimeError(f"W&B run state has no valid run_id: {path}")
@@ -447,6 +522,8 @@ def _selected_audio_paths(
         raise ValueError("Validation logging audio IDs must retain the payload's fixed order.")
     if any(path != result.audio_paths[item_id] for item_id, path in selected.items()):
         raise ValueError("Validation logging audio paths must match the durable payload.")
+    if any(sha256_file(path) != result.audio_sha256[item_id] for item_id, path in selected.items()):
+        raise ValueError("Validation logging audio content does not match the durable payload hash.")
     return MappingProxyType(selected)
 
 
@@ -486,6 +563,29 @@ def _audio_examples(wandb_module: Any, result: ValidationPayload, audio_paths: M
     ]
 
 
+def _snapshot_audio(result: ValidationPayload, audio_paths: Mapping[int, Path]) -> list[dict[str, object]]:
+    by_id = {item.row.id: item for item in result.items}
+    return [
+        {
+            "id": item_id,
+            "path": str(path),
+            "sha256": _verified_audio_hash(result, item_id, path),
+            "caption": (
+                f"id={item_id} | category={by_id[item_id].row.category} | "
+                f"prompt_id={by_id[item_id].prompt_id} | stressed={by_id[item_id].row.stressed}"
+            ),
+        }
+        for item_id, path in audio_paths.items()
+    ]
+
+
+def _verified_audio_hash(result: ValidationPayload, item_id: int, path: Path) -> str:
+    actual_hash = sha256_file(path)
+    if actual_hash != result.audio_sha256[item_id]:
+        raise ValueError("Validation snapshot audio content does not match the durable payload hash.")
+    return actual_hash
+
+
 def _aggregate_metric_payload(prefix: str, metrics: AggregateScore) -> dict[str, object]:
     separator = "/" if prefix else ""
     payload: dict[str, object] = {
@@ -511,6 +611,18 @@ def _payload_input_fingerprint(result: ValidationPayload) -> str:
     )
 
 
+def _require_matching_aggregate(actual: AggregateScore, expected: AggregateScore, label: str) -> None:
+    for field_name, expected_value in expected.__dict__.items():
+        if field_name == "category_metrics":
+            continue
+        actual_value = getattr(actual, field_name)
+        if actual_value != expected_value:
+            raise ValueError(f"{label} do not match the item scores ({field_name}).")
+    for rate_name in ("num_cer", "num_wer", "utt_cer", "utt_wer"):
+        if not math.isclose(getattr(actual, rate_name), getattr(expected, rate_name), rel_tol=0.0, abs_tol=1e-15):
+            raise ValueError(f"{label} do not match the item scores ({rate_name}).")
+
+
 def _run_directory(run: Any) -> Path:
     directory = getattr(run, "dir", None)
     if not isinstance(directory, str | Path):
@@ -529,12 +641,29 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
+def _write_and_validate_snapshot(path: Path, snapshot: Mapping[str, object], snapshot_fingerprint: str) -> None:
+    atomic_json(path, dict(snapshot))
+    _validate_snapshot(path, snapshot_fingerprint)
+
+
+def _validate_snapshot(path: Path, snapshot_fingerprint: str) -> dict[str, object]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"Validation boundary snapshot is unreadable: {path}") from error
+    if not isinstance(value, dict) or fingerprint(value) != snapshot_fingerprint:
+        raise RuntimeError(f"Validation boundary snapshot fingerprint does not match: {path}")
+    return value
+
+
 def _is_completed_boundary(
     path: Path,
     *,
+    snapshot_path: Path,
     run_id: str,
     config_fingerprint: str,
     input_fingerprint: str,
+    snapshot_fingerprint: str,
 ) -> bool:
     if not path.exists():
         return False
@@ -550,10 +679,44 @@ def _is_completed_boundary(
         "run_id": run_id,
         "config_fingerprint": config_fingerprint,
         "input_fingerprint": input_fingerprint,
+        "snapshot_path": snapshot_path.name,
+        "snapshot_fingerprint": snapshot_fingerprint,
     }
     if any(record.get(key) != value for key, value in expected.items()):
-        raise RuntimeError(f"Validation boundary is already complete for different inputs: {path}")
+        raise RuntimeError(f"Validation boundary is already complete for a different snapshot: {path}")
+    _validate_snapshot(snapshot_path, snapshot_fingerprint)
     return True
+
+
+def _require_matching_pending_boundary(
+    path: Path,
+    *,
+    snapshot_path: Path,
+    run_id: str,
+    config_fingerprint: str,
+    input_fingerprint: str,
+    snapshot_fingerprint: str,
+) -> None:
+    if not path.exists():
+        return
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"Validation boundary manifest is unreadable: {path}") from error
+    if not isinstance(record, dict):
+        raise RuntimeError(f"Validation boundary manifest is malformed: {path}")
+    if record.get("status") != "pending":
+        return
+    expected = {
+        "run_id": run_id,
+        "config_fingerprint": config_fingerprint,
+        "input_fingerprint": input_fingerprint,
+        "snapshot_path": snapshot_path.name,
+        "snapshot_fingerprint": snapshot_fingerprint,
+    }
+    if any(record.get(key) != value for key, value in expected.items()):
+        raise RuntimeError(f"Validation boundary is pending for a different snapshot: {path}")
+    _validate_snapshot(snapshot_path, snapshot_fingerprint)
 
 
 def _normalize_nonnegative_float_mapping(value: Mapping[str, float], label: str) -> dict[str, float]:

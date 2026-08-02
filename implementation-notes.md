@@ -23,3 +23,9 @@
 - Decision: Worker ranks receive a `NullRunManager`, so only the main process dynamically imports, initializes, logs, or finishes W&B. Memorization, stage 1, and stage 2 persist independent UUIDs before `wandb.init(..., resume="allow")`, while sharing the configured experiment group.
 - Decision: A validation handoff is immutable and rejects any boundary other than 2,000 unique scored IDs and four existing local WAVs. Each upload builds a fresh W&B table and retains the selection-owned audio ID order in captions.
 - Decision: Write an atomic pending boundary manifest before `run.log`; fsync the W&B run directory and atomically mark it complete only after `run.log` returns. Completed matching manifests suppress duplicate uploads on resume; failed or pending boundaries remain incomplete and retryable.
+
+## 2026-08-02 - W&B validation tracking Fix Round 1
+
+- Decision: A completed or pending boundary is identified by a canonical, atomically written and read-back full snapshot rather than a short metadata manifest. The snapshot holds every logged table row, metrics/counts/categories, progress, fingerprints, timing/failure values, and ordered local audio paths/hashes/captions; the manifest stores its fingerprint.
+- Decision: Validation recomputes aggregates from every `ItemScore`, and binds the Task-5 selection fingerprint plus ordered audio IDs to the payload. This prevents aggregate drift, wrong example ordering, changed WAVs, and score/benchmark normalized-gold divergence from reaching W&B.
+- Decision: Existing W&B state can resume only with the persisted config fingerprint. Local recovery is durable, but W&B backend acknowledgement is not made transactional; a crash after `run.log` remains safely retryable from the verified snapshot.
