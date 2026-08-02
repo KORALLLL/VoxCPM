@@ -161,14 +161,16 @@ class FakeCheckpointManager:
         self.events = events
         self.boundaries = []
         self.recoveries = []
+        self.recovery_metadata = []
         self.resume_state = None
         self.resume_kind = "boundary"
         self.stage2_expected = None
 
-    def _write(self, name, progress, kind):
+    def _write(self, name, progress, kind, supplied_metadata):
         path = self.root / name
         path.mkdir()
         metadata = {
+            **supplied_metadata,
             "checkpoint_fingerprint": f"{kind}-{progress.optimizer_step}",
             "checkpoint_kind": kind,
             **{key: value for key, value in progress.state_dict().items() if key != "schema_version"},
@@ -179,18 +181,39 @@ class FakeCheckpointManager:
     def save_same_stage(self, accelerator, model, progress, metadata, *, name=None):
         self.events.append(("checkpoint", progress.optimizer_step))
         self.boundaries.append(progress.state_dict())
-        return self._write(name or f"boundary-{progress.optimizer_step:04d}", progress, "boundary")
+        return self._write(name or f"boundary-{progress.optimizer_step:04d}", progress, "boundary", metadata)
 
     def save_recovery(self, accelerator, model, progress, metadata, *, name=None):
         self.events.append(("recovery", progress.optimizer_step))
         self.recoveries.append(progress.state_dict())
-        return self._write(name or f"recovery-{progress.optimizer_step:04d}", progress, "recovery")
+        self.recovery_metadata.append(dict(metadata))
+        return self._write(name or f"recovery-{progress.optimizer_step:04d}", progress, "recovery", metadata)
 
     def resume_same_stage(self, accelerator, model, progress, checkpoint, *, expected):
         self.events.append(("resume",))
-        assert self.resume_state is not None
+        metadata_path = Path(checkpoint) / "metadata.json"
+        existing = json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.is_file() else {}
+        if self.resume_state is None:
+            self.resume_kind = existing["checkpoint_kind"]
+            self.resume_state = {
+                "schema_version": 1,
+                **{
+                    key: existing[key]
+                    for key in (
+                        "stage",
+                        "epoch",
+                        "boundary",
+                        "microstep",
+                        "optimizer_step",
+                        "global_step",
+                        "sampler_seed",
+                        "sampler_epoch",
+                    )
+                },
+            }
         progress.load_state_dict(self.resume_state)
         metadata = {
+            **existing,
             "checkpoint_kind": self.resume_kind,
             "checkpoint_fingerprint": f"{self.resume_kind}-{progress.optimizer_step}",
             **{key: value for key, value in progress.state_dict().items() if key != "schema_version"},
@@ -200,6 +223,9 @@ class FakeCheckpointManager:
 
     def verify(self, checkpoint, expected):
         self.events.append(("verify-resume",))
+        metadata_path = Path(checkpoint) / "metadata.json"
+        if metadata_path.is_file():
+            return json.loads(metadata_path.read_text(encoding="utf-8"))
         assert self.resume_state is not None
         state = self.resume_state
         return {
@@ -677,6 +703,67 @@ def test_recovery_resume_at_exact_boundary_replaces_mismatched_marker_before_upd
     assert names.index("evaluate") < names.index("accumulate")
     assert fixture.evaluator.steps == [10]
     assert json.loads(marker_path.read_text(encoding="utf-8"))["checkpoint_fingerprint"] == "recovery-10"
+
+
+def test_exact_boundary_signal_recovery_reuses_production_boundary_marker_on_resume(tmp_path):
+    class StopAfterBoundaryEvaluator(FakeEvaluator):
+        trainer = None
+
+        def run(self, model, audio_vae, checkpoint, boundary):
+            result = super().run(model, audio_vae, checkpoint, boundary)
+            assert self.trainer is not None
+            self.trainer.request_stop()
+            return result
+
+    first_events = []
+    manager = FakeCheckpointManager(tmp_path / "checkpoints", first_events)
+    first_evaluator = StopAfterBoundaryEvaluator(first_events)
+    first = _make_trainer(
+        tmp_path,
+        runtime=FakeRuntime(first_events),
+        checkpoint_manager=manager,
+        evaluator=first_evaluator,
+        use_default_marker=True,
+    )
+    first_evaluator.trainer = first.trainer
+
+    recovery = first.trainer.run_stage(1)
+
+    boundary_checkpoint = manager.root / "boundary-0010"
+    boundary_marker = first.trainer._marker_path(boundary_checkpoint)
+    assert recovery.name == "recovery-0010"
+    assert first_evaluator.steps == [10]
+    assert boundary_marker.is_file()
+    assert not first.trainer._marker_path(recovery).exists()
+    assert manager.recovery_metadata[-1]["completed_boundary_proof"] == {
+        "version": 1,
+        "checkpoint_name": "boundary-0010",
+        "checkpoint_fingerprint": "boundary-10",
+        "boundary": {
+            "stage": "stage1",
+            "epoch": 0,
+            "boundary": 1,
+            "global_step": 10,
+            "stage_progress": 0.0625,
+        },
+    }
+
+    second_events = []
+    second_evaluator = FakeEvaluator(second_events)
+    second = _make_trainer(
+        tmp_path,
+        runtime=FakeRuntime(second_events, signal_after_sync=1),
+        checkpoint_manager=manager,
+        evaluator=second_evaluator,
+        resume_checkpoint=recovery,
+        use_default_marker=True,
+    )
+    manager.resume_state = None
+
+    second.trainer.run_stage(1)
+
+    assert second_evaluator.steps == []
+    assert manager.recoveries[-1]["optimizer_step"] == 11
 
 
 def test_same_stage2_recovery_resume_does_not_require_stage1_checkpoint(tmp_path):

@@ -229,6 +229,7 @@ class BalalaikaTrainer:
         self._accumulation_cursor = 0
         self._coordinated_recovery = True
         self._pending_boundary_checkpoint: Path | None = None
+        self._completed_boundary_proof: dict[str, Any] | None = None
 
     def request_stop(self, signum: int = signal.SIGTERM) -> None:
         """Request cooperative stop after the current complete accumulation group."""
@@ -352,12 +353,16 @@ class BalalaikaTrainer:
             if checkpoint_kind == "boundary" and not at_validation_boundary:
                 raise TrainerConfigurationError("boundary checkpoint progress is not at an exact validation boundary")
             if at_validation_boundary:
-                self._finish_boundary(
-                    model,
-                    audio_vae,
+                boundary = self._evaluation_boundary(progress, total_steps)
+                proof_complete = checkpoint_kind == "recovery" and self._recovery_boundary_proof_complete(
                     self.resume_checkpoint,
-                    self._evaluation_boundary(progress, total_steps),
+                    restored,
+                    progress,
+                    boundary,
+                    checkpoint_metadata,
                 )
+                if not proof_complete:
+                    self._finish_boundary(model, audio_vae, self.resume_checkpoint, boundary)
 
         with self._signal_handlers():
             return self._train(
@@ -555,11 +560,18 @@ class BalalaikaTrainer:
         if self._accumulation_cursor != 0 or not self._safe_for_recovery:
             raise TrainingRestartRequired("cannot save recovery inside an incomplete accumulation group")
         self.runtime.barrier()
+        recovery_metadata: dict[str, Any] = {
+            **metadata,
+            "recovery_reason": reason,
+            "recovery_signal": self._stop_signal,
+        }
+        if self._proof_matches_progress(self._completed_boundary_proof, progress):
+            recovery_metadata["completed_boundary_proof"] = self._completed_boundary_proof
         path = self.checkpoint_manager.save_recovery(
             _accelerator(self.runtime),
             model,
             progress,
-            {**metadata, "recovery_reason": reason, "recovery_signal": self._stop_signal},
+            recovery_metadata,
         )
         self.last_durable_checkpoint = path
         return path
@@ -575,13 +587,126 @@ class BalalaikaTrainer:
         if self.boundary_marker is None:
             existing = self._completed_marker_collectively(checkpoint, boundary)
             if existing is not None:
+                self._completed_boundary_proof = self._boundary_proof(checkpoint, boundary)
                 self._pending_boundary_checkpoint = None
                 return existing
         evaluator = self.evaluator_factory(boundary, checkpoint)
         evaluator.run(model, audio_vae, checkpoint, boundary)
         marker = self._write_boundary_marker_collectively(checkpoint, boundary)
+        self._completed_boundary_proof = (
+            self._boundary_proof(checkpoint, boundary) if self.boundary_marker is None else None
+        )
         self._pending_boundary_checkpoint = None
         return marker
+
+    def _recovery_boundary_proof_complete(
+        self,
+        recovery_checkpoint: Path,
+        recovery_metadata: Mapping[str, Any],
+        progress: TrainingProgress,
+        boundary: EvaluationBoundary,
+        checkpoint_metadata: Mapping[str, Any],
+    ) -> bool:
+        proof = recovery_metadata.get("completed_boundary_proof")
+        complete = False
+        if self.runtime.rank == 0:
+            complete = self._validate_boundary_proof(
+                recovery_checkpoint,
+                proof,
+                progress,
+                boundary,
+                checkpoint_metadata,
+            )
+        outcome = torch.tensor([1 if complete else 0], dtype=torch.int8, device=self.runtime.device)
+        try:
+            gathered = self.runtime.gather(outcome).reshape(-1)
+        except BaseException as error:
+            self._coordinated_recovery = False
+            raise self._restart_required(error) from error
+        complete = bool(gathered[0].item())
+        if complete:
+            assert isinstance(proof, Mapping)
+            self._completed_boundary_proof = dict(proof)
+        return complete
+
+    def _validate_boundary_proof(
+        self,
+        recovery_checkpoint: Path,
+        proof: Any,
+        progress: TrainingProgress,
+        boundary: EvaluationBoundary,
+        checkpoint_metadata: Mapping[str, Any],
+    ) -> bool:
+        if not isinstance(proof, Mapping) or set(proof) != {
+            "version",
+            "checkpoint_name",
+            "checkpoint_fingerprint",
+            "boundary",
+        }:
+            return False
+        checkpoint_name = proof.get("checkpoint_name")
+        checkpoint_fingerprint = proof.get("checkpoint_fingerprint")
+        if (
+            proof.get("version") != 1
+            or not isinstance(checkpoint_name, str)
+            or not checkpoint_name
+            or not isinstance(checkpoint_fingerprint, str)
+            or not checkpoint_fingerprint
+            or Path(checkpoint_name).name != checkpoint_name
+            or checkpoint_name.startswith(".")
+            or proof.get("boundary") != asdict(boundary)
+        ):
+            return False
+        source_checkpoint = Path(recovery_checkpoint).parent / checkpoint_name
+        progress_identity = {key: value for key, value in progress.state_dict().items() if key != "schema_version"}
+        try:
+            self.checkpoint_manager.verify(
+                source_checkpoint,
+                {
+                    **checkpoint_metadata,
+                    **progress_identity,
+                    "checkpoint_kind": "boundary",
+                    "checkpoint_fingerprint": checkpoint_fingerprint,
+                },
+            )
+            return self._completed_marker(source_checkpoint, boundary) is not None
+        except Exception:
+            # Missing, corrupt, or mismatched proof is never accepted.  It is
+            # safe to fall back to completing validation for the recovery
+            # checkpoint itself.
+            return False
+
+    def _boundary_proof(self, checkpoint: Path, boundary: EvaluationBoundary) -> dict[str, Any]:
+        checkpoint_fingerprint: Any = None
+        metadata_error: BaseException | None = None
+        try:
+            checkpoint_fingerprint = _checkpoint_metadata_file(checkpoint)["checkpoint_fingerprint"]
+        except BaseException as error:
+            metadata_error = error
+        self._coordinate_local_phase(metadata_error is None, "boundary proof")
+        if metadata_error is not None:
+            raise metadata_error
+        return {
+            "version": 1,
+            "checkpoint_name": Path(checkpoint).name,
+            "checkpoint_fingerprint": checkpoint_fingerprint,
+            "boundary": asdict(boundary),
+        }
+
+    @staticmethod
+    def _proof_matches_progress(proof: Mapping[str, Any] | None, progress: TrainingProgress) -> bool:
+        if not isinstance(proof, Mapping):
+            return False
+        boundary = proof.get("boundary")
+        return isinstance(boundary, Mapping) and all(
+            boundary.get(key) == value
+            for key, value in {
+                "stage": progress.stage,
+                "epoch": progress.epoch,
+                "boundary": progress.boundary,
+                "global_step": progress.global_step,
+            }.items()
+        )
 
     def _completed_marker_collectively(
         self,

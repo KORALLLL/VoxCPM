@@ -102,3 +102,9 @@
 - Changed: Rank-local state-save, checkpoint finalization, and boundary-marker errors are converted into one gathered phase outcome before any rank raises. A failure of that outcome collective is typed as restart-required so the trainer never attempts another barrier or recovery save.
 - Decision: Reject any configured curriculum other than stage 1 = 2 epochs at 1e-4 and stage 2 = 3 epochs at 5e-5 before model setup. Seedable loaders receive the persisted sampler epoch before both initial and replay iterators, while the next real epoch increments once.
 - Validation: Targeted runtime/checkpoint/trainer tests pass 83 cases; focused trainer/checkpoint/evaluator/runtime/probe integration passes 107; the full `tests/` suite passes 278 with 5 warnings. Final real eight-process evidence reports one prepare, a deterministic same-epoch replay after one skipped synchronized attempt, next sampler epoch +1, 4 attempts, 3 real optimizer steps, and 3 scheduler steps on every rank.
+
+## 2026-08-02 - Two-stage LoRA trainer Fix Round 2
+
+- Changed: A recovery created immediately after a completed validation boundary now carries the source boundary checkpoint name, fingerprint, and exact evaluator boundary identity in its own fingerprinted metadata.
+- Decision: Recovery resume suppresses validation only after rank zero fully verifies the referenced immutable checkpoint at the exact restored progress and verifies its matching durable marker. The result is gathered once; absent, malformed, corrupt, or mismatched proof falls back to evaluator completion rather than being trusted.
+- Validation: The production-shaped regression failed before the fix because step 10 appeared in the resumed evaluator (`assert [10] == []`), then passed after the proof bridge. Trainer/checkpoint coverage passes 76 tests and broader trainer/checkpoint/evaluator/runtime/probe coverage passes 108 tests, both with 4 warnings. Changed-file Black, compileall, and diff checks pass.

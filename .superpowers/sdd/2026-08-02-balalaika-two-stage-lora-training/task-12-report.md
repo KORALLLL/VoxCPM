@@ -50,3 +50,43 @@ Implemented the Task 12 two-stage trainer and the required Task 9 recovery-check
 - The mandated curriculum is enforced before model construction: stage 1 is exactly 2 epochs at `1e-4`; stage 2 is exactly 3 epochs at `5e-5`, preserving 16 and 24 validations respectively.
 - Targeted RED/GREEN coverage includes accumulation>1 mid-group loader/forward faults, skipped-step signal latching, exact-boundary recovery before/after/mismatched marker, same-epoch replay seeding and next-epoch increment, curriculum drift, rank-local/peer state-save, finalize and marker failures, and broken collectives. Focused integration passes `107` tests; the full CPU suite passes `278` tests with 5 warnings.
 - A final real eight-process Accelerate 1.14 CPU/Gloo regression passed on the formatted tree. All ranks reported one joint prepare, 4 synchronized attempts including one synthetic skipped update, 3 real optimizer steps, exactly 3 scheduler steps (not 24), identical sample prefixes when replaying sampler epoch 17, and a changed order after advancing once to epoch 18.
+
+## Fix Round 2
+
+An exact-boundary signal recovery previously lost the durable proof produced by the immediately preceding boundary transaction. The marker remained keyed and fingerprint-bound to `boundary-0010`, while resume looked only for a marker keyed to `recovery-0010`, so validation ran twice.
+
+Recovery metadata now carries a strict `completed_boundary_proof`: boundary checkpoint name, checkpoint fingerprint, and exact evaluator boundary identity. The recovery metadata fingerprint protects that proof. On resume, rank zero accepts it only after fully verifying the referenced immutable boundary checkpoint against the restored progress and expected identity, and then verifying its exact durable marker. Every rank receives the same decision. Missing, malformed, corrupt, or mismatched proof remains incomplete and follows the existing evaluator/marker completion path.
+
+RED command and exact result:
+
+```text
+rtk run '.venv/bin/pytest -q tests/training/balalaika/test_trainer.py::test_exact_boundary_signal_recovery_reuses_production_boundary_marker_on_resume'
+
+FAILED tests/training/balalaika/test_trainer.py::test_exact_boundary_signal_recovery_reuses_production_boundary_marker_on_resume
+E       assert [10] == []
+1 failed, 4 warnings in 4.17s
+```
+
+GREEN command and exact result:
+
+```text
+rtk run '.venv/bin/pytest -q tests/training/balalaika/test_trainer.py::test_exact_boundary_signal_recovery_reuses_production_boundary_marker_on_resume'
+
+1 passed, 4 warnings in 4.09s
+```
+
+Focused trainer/checkpoint command and exact result:
+
+```text
+rtk run '.venv/bin/pytest -q tests/training/balalaika/test_trainer.py tests/training/balalaika/test_checkpoint.py'
+
+76 passed, 4 warnings in 6.14s
+```
+
+Broader relevant command and exact result:
+
+```text
+rtk run '.venv/bin/pytest -q tests/training/balalaika/test_trainer.py tests/training/balalaika/test_checkpoint.py tests/training/balalaika/test_evaluation.py tests/training/balalaika/test_runtime.py tests/training/balalaika/test_probe.py'
+
+108 passed, 4 warnings in 8.01s
+```
