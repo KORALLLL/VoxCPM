@@ -1,14 +1,16 @@
+from __future__ import annotations
+
 import math
-from typing import Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import argbind
 import torch
 from datasets import Audio, Dataset, DatasetDict, load_dataset
 from torch.utils.data import Dataset as TorchDataset
 
-from ..model.voxcpm import VoxCPMConfig
-from ..modules.audiovae import AudioVAE
-from .packers import AudioFeatureProcessingPacker
+if TYPE_CHECKING:
+    from ..model.voxcpm import VoxCPMConfig
+    from ..modules.audiovae import AudioVAE
 
 DEFAULT_TEXT_COLUMN = "text"
 DEFAULT_AUDIO_COLUMN = "audio"
@@ -120,6 +122,52 @@ def compute_sample_lengths(
     return lengths
 
 
+class VoxCPMCollator:
+    """Pad VoxCPM samples returned by any compatible training dataset."""
+
+    @staticmethod
+    def pad_sequences(seqs: List[torch.Tensor], pad_value: float):
+        if not seqs:
+            return torch.empty(0)
+        max_len = max(seq.shape[0] for seq in seqs)
+        padded = []
+        for seq in seqs:
+            if seq.shape[0] < max_len:
+                pad_width = (0, max_len - seq.shape[0])
+                seq = torch.nn.functional.pad(seq, pad_width, value=pad_value)
+            padded.append(seq)
+        return torch.stack(padded)
+
+    def __call__(self, batch: List[Dict]):
+        text_tensors = [torch.tensor(sample["text_ids"], dtype=torch.int32) for sample in batch]
+        audio_tensors = [torch.tensor(sample["audio_array"], dtype=torch.float32) for sample in batch]
+        dataset_ids = torch.tensor([sample["dataset_id"] for sample in batch], dtype=torch.int32)
+        is_prompts = [bool(sample.get("is_prompt", False)) for sample in batch]
+
+        text_padded = self.pad_sequences(text_tensors, pad_value=-100)
+        audio_padded = self.pad_sequences(audio_tensors, pad_value=-100.0)
+        task_ids = torch.ones(text_padded.size(0), dtype=torch.int32)
+
+        result = {
+            "text_tokens": text_padded,
+            "audio_tokens": audio_padded,
+            "task_ids": task_ids,
+            "dataset_ids": dataset_ids,
+            "is_prompts": is_prompts,
+        }
+
+        if "ref_audio_array" in batch[0]:
+            ref_tensors = [torch.tensor(s["ref_audio_array"], dtype=torch.float32) for s in batch]
+            result["ref_audio_tokens"] = self.pad_sequences(ref_tensors, pad_value=-100.0)
+
+        return result
+
+    @staticmethod
+    def collate_fn(batch: List[Dict]):
+        """Function-style compatibility entrypoint for DataLoader callers."""
+        return VoxCPMCollator()(batch)
+
+
 class HFVoxCPMDataset(TorchDataset):
     """
     Thin wrapper around a tokenized HuggingFace dataset that returns
@@ -127,6 +175,8 @@ class HFVoxCPMDataset(TorchDataset):
     """
 
     _SENTINEL = [-100.0]
+    pad_sequences = staticmethod(VoxCPMCollator.pad_sequences)
+    collate_fn = staticmethod(VoxCPMCollator.collate_fn)
 
     def __init__(self, dataset: Dataset):
         self.dataset = dataset
@@ -150,44 +200,6 @@ class HFVoxCPMDataset(TorchDataset):
             sample["ref_audio_array"] = ref["array"] if ref else self._SENTINEL
         return sample
 
-    @staticmethod
-    def pad_sequences(seqs: List[torch.Tensor], pad_value: float):
-        if not seqs:
-            return torch.empty(0)
-        max_len = max(seq.shape[0] for seq in seqs)
-        padded = []
-        for seq in seqs:
-            if seq.shape[0] < max_len:
-                pad_width = (0, max_len - seq.shape[0])
-                seq = torch.nn.functional.pad(seq, pad_width, value=pad_value)
-            padded.append(seq)
-        return torch.stack(padded)
-
-    @classmethod
-    def collate_fn(cls, batch: List[Dict]):
-        text_tensors = [torch.tensor(sample["text_ids"], dtype=torch.int32) for sample in batch]
-        audio_tensors = [torch.tensor(sample["audio_array"], dtype=torch.float32) for sample in batch]
-        dataset_ids = torch.tensor([sample["dataset_id"] for sample in batch], dtype=torch.int32)
-        is_prompts = [bool(sample.get("is_prompt", False)) for sample in batch]
-
-        text_padded = cls.pad_sequences(text_tensors, pad_value=-100)
-        audio_padded = cls.pad_sequences(audio_tensors, pad_value=-100.0)
-        task_ids = torch.ones(text_padded.size(0), dtype=torch.int32)
-
-        result = {
-            "text_tokens": text_padded,
-            "audio_tokens": audio_padded,
-            "task_ids": task_ids,
-            "dataset_ids": dataset_ids,
-            "is_prompts": is_prompts,
-        }
-
-        if "ref_audio_array" in batch[0]:
-            ref_tensors = [torch.tensor(s["ref_audio_array"], dtype=torch.float32) for s in batch]
-            result["ref_audio_tokens"] = cls.pad_sequences(ref_tensors, pad_value=-100.0)
-
-        return result
-
 
 class BatchProcessor:
     """
@@ -203,6 +215,8 @@ class BatchProcessor:
         dataset_cnt: int,
         device: torch.device,
     ):
+        from .packers import AudioFeatureProcessingPacker
+
         self.device = device
         self.dataset_cnt = dataset_cnt
         self.audio_vae = audio_vae
@@ -251,6 +265,6 @@ def build_dataloader(
         batch_size=batch_size,
         num_workers=num_workers,
         shuffle=True,
-        collate_fn=HFVoxCPMDataset.collate_fn,
+        collate_fn=VoxCPMCollator(),
         drop_last=drop_last,
     )
