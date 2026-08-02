@@ -66,3 +66,13 @@
 - Validation: The reordered original smoke passed under `rtk timeout 180s .venv/bin/accelerate launch --num_processes 1 ... --mode train-checkpoint` and `rtk timeout 240s .venv/bin/accelerate launch --num_processes 8 --main_process_port 0 ... --mode train-checkpoint`. The full CPU suite passes 220 tests. Fix-round logs are stored beside prior Task 10 artifacts.
 - Decision: The second allowed minimal Accelerate fix passed the rank-fault and original smokes; Accelerate remains primary and native DDP remains unimplemented.
 - Follow-up: The minor smoke-test RNG assertion finding remains deferred as directed; production CPU/local-CUDA RNG rollback remains covered.
+
+## 2026-08-02 - Distributed Balalaika evaluator
+
+- Decision: Keep the evaluator's production boundary dependency-injected: the runtime, Task-5 selection, boundary-local Task-7 ledger, per-rank ASR factory, and rank-aware tracking manager are supplied by the trainer. The evaluator derives and validates all item inputs from the current checkpoint, boundary, benchmark rows, prompt files, and selection fingerprint.
+- Decision: Treat aggregate JSON/JSONL as a deterministic durable snapshot. W&B logging must finish before `validation-complete.json` is atomically published; only a matching durable completion permits retention.
+- Decision: Retain the four selection-owned WAVs in a compact per-boundary archive before pruning older completed boundaries' full `wavs/` trees. Incomplete boundaries are never pruned.
+- Changed: The evaluator restores the unwrapped model and retained AudioVAE modes only after the per-rank ASR adapter has been closed. Generation temporarily attaches the AudioVAE, while every ledger mutation receives the live token/epoch claim.
+- Validation: RED was the absent `evaluation.py` import and the absent smoke `validation` CLI. GREEN passes 9 focused evaluator tests, 66 evaluator/ledger/metrics/tracking/runtime tests, and all 229 repository tests. Black, `py_compile`, and `git diff --check` pass.
+- Validation: The final-tree required no-network smoke passed with eight real Accelerate processes and 32 synthetic items. Every rank generated four unique position-modulo IDs, released one fake ASR session, and verified the completion; rank 0 published one aggregate, one completion, and one tracking record. Artifacts are under `.superpowers/sdd/2026-08-02-balalaika-two-stage-lora-training/task-11-artifacts/validation-8x-1785702862763622381`.
+- Environment: Two earlier 240/150-second diagnostics used an allocated PTY and timed out before script entry because the Accelerate parent was job-control stopped (`T` state). The unchanged required command without a PTY exited 0 in about 112 seconds; this was a harness issue, not an evaluator fix.

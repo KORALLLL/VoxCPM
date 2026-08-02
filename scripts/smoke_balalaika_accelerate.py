@@ -8,6 +8,7 @@ import json
 import time
 from pathlib import Path
 from types import SimpleNamespace
+import wave
 
 import accelerate
 import torch
@@ -15,6 +16,10 @@ from torch.utils.data import DataLoader, Dataset
 
 from voxcpm.training.balalaika.probe import probe_microbatch
 from voxcpm.training.balalaika.runtime import AccelerateRuntime
+from voxcpm.training.balalaika.artifacts import atomic_json, sha256_file
+from voxcpm.training.balalaika.evaluation import DistributedEvaluator
+from voxcpm.training.balalaika.ledger import ValidationLedger
+from voxcpm.training.balalaika.metrics import BenchmarkRow
 
 _ACCUMULATION = 2
 _MICROBATCH = 2
@@ -81,10 +86,72 @@ class _SyntheticLocalProbeStep:
         self.optimizer.step()
 
 
+class _SyntheticValidationModel(torch.nn.Module):
+    """Fake VoxCPM surface that records exact evaluator assignments."""
+
+    sample_rate = 16_000
+
+    def __init__(self):
+        super().__init__()
+        self.audio_vae = None
+        self.item_ids: list[int] = []
+
+    def generate(self, **kwargs: object) -> torch.Tensor:
+        if self.audio_vae is None:
+            raise AssertionError("validation evaluator did not attach the retained AudioVAE")
+        item_id = int(str(kwargs["target_text"]).split()[-1])
+        if kwargs["prompt_text"] != "синтетический промпт":
+            raise AssertionError("validation evaluator changed the fixed prompt text")
+        self.item_ids.append(item_id)
+        return torch.full((80,), (item_id + 1) / 1_000.0, dtype=torch.float32)
+
+
+class _SyntheticValidationASR:
+    def __init__(self, close_events: list[str]):
+        self.close_events = close_events
+
+    def transcribe(self, wav_path: Path) -> str:
+        item_id = int(Path(wav_path).stem)
+        return "" if item_id == 0 else f"номер {item_id}"
+
+    def close(self) -> None:
+        self.close_events.append("closed")
+
+
+class _RankZeroValidationTracking:
+    """Durable local tracking fake; importing or contacting W&B is unnecessary."""
+
+    def __init__(self, root: Path, rank: int):
+        if rank != 0:
+            raise AssertionError("non-main rank initialized validation tracking")
+        self.root = root
+        atomic_json(root / "tracking-init.json", {"init_ranks": [rank]})
+
+    def log_validation(self, payload: object, *, global_step: int) -> None:
+        path = self.root / "tracking-log.json"
+        if path.exists():
+            raise AssertionError("validation aggregate was tracked more than once")
+        atomic_json(
+            path,
+            {
+                "log_count": 1,
+                "global_step": global_step,
+                "item_count": payload.metrics.item_count,
+                "audio_ids": list(payload.audio_paths),
+            },
+        )
+
+
+class _WorkerValidationTracking:
+    def log_validation(self, payload: object, *, global_step: int) -> None:
+        raise AssertionError("non-main rank attempted validation tracking")
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=("train-checkpoint", "probe-rank-fault"), required=True)
+    parser.add_argument("--mode", choices=("train-checkpoint", "probe-rank-fault", "validation"), required=True)
     parser.add_argument("--runtime", choices=("accelerate",), default="accelerate")
+    parser.add_argument("--items", type=int, default=32)
     return parser.parse_args()
 
 
@@ -393,12 +460,160 @@ def _run_probe_rank_fault() -> None:
         )
 
 
+def _write_validation_prompt(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(path), "wb") as audio:
+        audio.setnchannels(1)
+        audio.setsampwidth(2)
+        audio.setframerate(16_000)
+        audio.writeframes(b"\x00\x00" * 80)
+
+
+def _validation_root(runtime: AccelerateRuntime) -> Path:
+    nonce = time.time_ns() if runtime.rank == 0 else 0
+    gathered = runtime.gather(torch.tensor([nonce], dtype=torch.int64, device=runtime.device))
+    shared_nonce = int(gathered.reshape(-1)[0].item())
+    return (
+        Path(__file__).resolve().parents[1]
+        / ".superpowers"
+        / "sdd"
+        / "2026-08-02-balalaika-two-stage-lora-training"
+        / "task-11-artifacts"
+        / f"validation-{runtime.world_size}x-{shared_nonce}"
+    )
+
+
+def _smoke_payload(**values: object) -> SimpleNamespace:
+    return SimpleNamespace(**values)
+
+
+def _run_validation(items: int) -> None:
+    if not torch.cuda.is_available():
+        raise RuntimeError("the required validation smoke must run on CUDA")
+    runtime = AccelerateRuntime.create(SimpleNamespace(accumulation=1))
+    if items != 32:
+        raise ValueError("validation smoke requires exactly --items 32")
+    if runtime.world_size != 8:
+        raise RuntimeError("validation smoke requires exactly eight processes")
+    root = _validation_root(runtime)
+    if runtime.rank == 0:
+        root.mkdir(parents=True, exist_ok=False)
+        _write_validation_prompt(root / "selection" / "prompt.wav")
+    runtime.barrier()
+
+    prompt_path = root / "selection" / "prompt.wav"
+    prompt = SimpleNamespace(
+        prompt_id="prompt-00",
+        text="синтетический промпт",
+        wav_path=prompt_path,
+        wav_sha256=sha256_file(prompt_path),
+    )
+    rows = tuple(
+        BenchmarkRow(
+            id=item_id,
+            category="number" if item_id % 2 == 0 else "date",
+            text=f"номер {item_id}",
+            normalized_gold=f"номер {item_id}",
+            stressed=f"но́мер {item_id}",
+        )
+        for item_id in range(items)
+    )
+    selection = SimpleNamespace(
+        fingerprint="synthetic-selection-fingerprint",
+        prompts=[prompt],
+        benchmark_prompt_by_id={row.id: prompt.prompt_id for row in rows},
+        audio_log_ids=[0, 7, 16, 31],
+    )
+    ledger = ValidationLedger(
+        root / "boundary-01",
+        generation_fingerprint="synthetic-generation-fingerprint",
+        asr_fingerprint="synthetic-asr-fingerprint",
+        max_attempts=2,
+    )
+    tracking = _RankZeroValidationTracking(root, runtime.rank) if runtime.rank == 0 else _WorkerValidationTracking()
+    asr_close_events: list[str] = []
+    evaluator = DistributedEvaluator(
+        runtime=runtime,
+        rows=rows,
+        selection=selection,
+        ledger=ledger,
+        asr_factory=lambda _device_id: _SyntheticValidationASR(asr_close_events),
+        run_manager=tracking,
+        expected_item_count=items,
+        validation_root=root,
+        payload_factory=_smoke_payload,
+    )
+    model = _SyntheticValidationModel()
+    audio_vae = torch.nn.Identity()
+    payload = evaluator.run(
+        model,
+        audio_vae,
+        {"checkpoint_fingerprint": "synthetic-checkpoint-fingerprint"},
+        {
+            "stage": "stage1",
+            "epoch": 0,
+            "boundary": 1,
+            "global_step": 1,
+            "stage_progress": 0.125,
+        },
+    )
+    if len(model.item_ids) != 4 or len(set(model.item_ids)) != 4:
+        raise AssertionError(f"rank {runtime.rank} did not generate exactly four unique IDs: {model.item_ids}")
+    if asr_close_events != ["closed"]:
+        raise AssertionError(f"rank {runtime.rank} did not release its ASR session: {asr_close_events}")
+    if payload.metrics.item_count != items:
+        raise AssertionError(f"rank {runtime.rank} did not verify the complete aggregate payload")
+
+    local = torch.tensor(model.item_ids, dtype=torch.int64, device=runtime.device)
+    gathered = runtime.gather(local).reshape(runtime.world_size, -1).cpu()
+    partitions = [row.tolist() for row in gathered]
+    flattened = [item_id for partition in partitions for item_id in partition]
+    if sorted(flattened) != list(range(items)) or len(set(flattened)) != items:
+        raise AssertionError(f"validation partitions are not disjoint and complete: {partitions}")
+    evidence = {
+        "rank": runtime.rank,
+        "world_size": runtime.world_size,
+        "item_ids": model.item_ids,
+        "generation_count": len(model.item_ids),
+        "asr_released": asr_close_events == ["closed"],
+    }
+    print("VALIDATION_RANK_EVIDENCE " + json.dumps(evidence, sort_keys=True), flush=True)
+    runtime.barrier()
+    if runtime.rank == 0:
+        tracking_init = json.loads((root / "tracking-init.json").read_text(encoding="utf-8"))
+        tracking_log = json.loads((root / "tracking-log.json").read_text(encoding="utf-8"))
+        aggregate_files = list(root.rglob("metrics.json"))
+        completion_files = list(root.rglob("validation-complete.json"))
+        if len(aggregate_files) != 1 or len(completion_files) != 1 or tracking_log["log_count"] != 1:
+            raise AssertionError("validation smoke did not publish exactly one rank-zero aggregate")
+        print(
+            "VALIDATION_SMOKE_RESULT "
+            + json.dumps(
+                {
+                    "status": "PASS",
+                    "world_size": runtime.world_size,
+                    "items": items,
+                    "partitions": partitions,
+                    "aggregate_files": len(aggregate_files),
+                    "completion_files": len(completion_files),
+                    "tracking_init_ranks": tracking_init["init_ranks"],
+                    "tracking_log_count": tracking_log["log_count"],
+                    "artifact_root": str(root),
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+
+
 def main() -> None:
     args = _parse_args()
     if args.mode == "train-checkpoint":
         _run_train_checkpoint()
     elif args.mode == "probe-rank-fault":
         _run_probe_rank_fault()
+    elif args.mode == "validation":
+        _run_validation(args.items)
 
 
 if __name__ == "__main__":
