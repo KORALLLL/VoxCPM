@@ -97,11 +97,16 @@ audio bytes directly from indexed tar offsets, decodes and resamples them only
 when requested, and tokenizes `rover_punctuated_accented` for VoxCPM2.
 
 Training uses ordinary fixed-size shuffled batches. Duration bucketing is
-explicitly out of scope. Distributed sampling assigns each rank a disjoint
-subset, gives every rank the same number of complete batches, calls
-`set_epoch()` at epoch boundaries, and makes sample order a pure function of
-the recorded seed and epoch. Any remainder that cannot make an equal complete
-distributed batch is dropped and counted in run metadata.
+explicitly out of scope. On the primary path, the input DataLoader is not
+pre-sharded with a PyTorch `DistributedSampler`; Accelerate alone shards its
+seeded fixed-batch sampler across ranks. This avoids double sharding. The
+prepared loader gives each rank a disjoint subset and the same number of
+complete batches, exposes epoch reseeding through Accelerate's prepared-loader
+contract, and makes sample order a pure function of the recorded seed and
+epoch. Any remainder that cannot make an equal complete distributed batch is
+dropped and counted in run metadata. The controlled native DDP fallback uses
+`DistributedSampler` with equivalent seed, `drop_last`, and `set_epoch()`
+semantics because Accelerate is absent on that path.
 
 DataLoader workers partition reads without duplicating samples. Each worker
 maintains a bounded file-handle cache so it does not repeatedly reopen the 519
@@ -149,9 +154,13 @@ timestamp. Stage 1 refuses an absent or mismatched approval record.
 
 ## Distributed LoRA Training
 
-Training uses one process per GPU under `torchrun`, PyTorch DDP, NCCL, and BF16
-autocast on eight RTX 5090 GPUs. Only LoRA parameters are optimized. The initial
-adapter configuration is:
+Training primarily uses Hugging Face Accelerate, launched with
+`accelerate launch` as one process per GPU, with NCCL-backed distributed data
+parallelism and BF16 mixed precision on eight RTX 5090 GPUs. Model, optimizer,
+dataloader, and scheduler preparation, gradient accumulation, gradient
+clipping, cross-rank synchronization, and state restoration use Accelerate's
+public APIs. Only LoRA parameters are optimized. The initial adapter
+configuration is:
 
 - language-model LoRA enabled;
 - diffusion-transformer LoRA enabled;
@@ -162,6 +171,17 @@ adapter configuration is:
 
 The configuration remains externally configurable but becomes part of the
 checkpoint and resume fingerprint.
+
+Native PyTorch DDP is a controlled fallback, not a second routinely supported
+launcher. The implementation first performs an Accelerate integration spike
+covering eight-rank sample partitioning, gradient accumulation without
+unnecessary synchronization, LoRA gradient reduction, checkpoint/resume, and
+distributed validation aggregation. It falls back to `torchrun` plus native
+DDP only if that spike has a reproducible blocking failure that cannot be
+resolved without changing model behavior or expanding scope materially. The
+failure reproduction and fallback decision are recorded in implementation
+notes and run metadata. Both paths must preserve the same configuration,
+dataset, checkpoint, and metric semantics.
 
 A bounded startup probe tests candidate fixed per-GPU microbatch sizes on a
 representative long eligible sample and selects the largest size that completes
@@ -256,7 +276,8 @@ Checkpoints are written atomically and include:
 
 - LoRA weights;
 - optimizer and scheduler state for the current stage;
-- AMP/scaler state when applicable;
+- Accelerate mixed-precision and distributed state, including scaler state
+  when applicable;
 - stage, epoch, fractional boundary, microstep, and optimizer step;
 - random-number-generator state;
 - distributed sampler seed and epoch;
@@ -299,8 +320,8 @@ Automated tests cover:
 - the exact `< 0.95` and `>= 0.95` split boundary;
 - exclusion and reporting of null agreement;
 - deterministic four-example, 20-voice, and 2,000-assignment manifests;
-- distributed sample uniqueness, equal batch counts, dropped remainders, and
-  epoch reseeding;
+- Accelerate distributed sample uniqueness, equal batch counts, dropped
+  remainders, gradient synchronization, and epoch reseeding;
 - exact one-eighth-epoch trigger calculation;
 - number-span extraction and golden CER/WER results using character and word
   denominators;
@@ -314,10 +335,15 @@ and validation aggregation without proprietary data. GPU verification then
 proceeds in increasing cost:
 
 1. a single-GPU forward/backward/checkpoint smoke test;
-2. an eight-GPU DDP smoke test that checks disjoint samples, synchronized
-   optimizer steps, LoRA gradients, and restore behavior;
+2. an eight-GPU Accelerate smoke test that checks disjoint samples,
+   synchronized optimizer steps, LoRA gradients, accumulation behavior, and
+   restore behavior;
 3. a small distributed validation smoke test; and
 4. the real four-example memorization experiment and manual W&B review.
+
+If and only if the documented Accelerate spike triggers the controlled native
+DDP fallback, the same eight-GPU and distributed-validation smoke tests are
+rerun through that fallback before memorization.
 
 The large stage-1 run is not launched as part of implementation or verification;
 it begins only after the operator creates the matching approval record and
