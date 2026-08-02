@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import fcntl
 import hashlib
 import io
 import json
 import os
 from pathlib import Path
 import random
+import shutil
 import sqlite3
-from tempfile import NamedTemporaryFile
+from tempfile import NamedTemporaryFile, mkdtemp
 from typing import Iterator, Sequence, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -98,59 +100,77 @@ def create_selection_manifests(
     if not benchmark_path.is_file():
         raise FileNotFoundError(benchmark_path)
 
-    database = _open_index(index_path)
-    try:
-        sidecar_path = _sidecar_path(database)
-        index_fingerprint = _metadata_value(database, "fingerprint")
-        memorization_rows = _reservoir(
-            _iter_samples(database, stage=2), _MEMORIZATION_COUNT, random.Random(seed), "stage-2 memorization"
-        )
-        validation_rng = random.Random(_derived_seed(seed, "validation-prompts"))
-        prompt_rows = _reservoir(
-            _iter_samples(database, stage=None), _PROMPT_COUNT, validation_rng, "usable prompt"
-        )
-    finally:
-        database.close()
+    with _SelectionBuildLock(output_dir):
+        database = _open_index(index_path)
+        try:
+            sidecar_path = _sidecar_path(database)
+            index_fingerprint = _metadata_value(database, "fingerprint")
+            memorization_rows = _reservoir(
+                _iter_samples(database, stage=2), _MEMORIZATION_COUNT, random.Random(seed), "stage-2 memorization"
+            )
+            validation_rng = random.Random(_derived_seed(seed, "validation-prompts"))
+            prompt_rows = _reservoir(
+                _iter_samples(database, stage=None), _PROMPT_COUNT, validation_rng, "usable prompt"
+            )
+        finally:
+            database.close()
 
-    memorization = [
-        _materialize(row, sidecar_path, output_dir / "audio" / "memorization" / f"item-{number:02d}.wav")
-        for number, row in enumerate(memorization_rows)
-    ]
-    prompts = [
-        PromptSample(
-            prompt_id=f"prompt-{number:02d}",
-            **_materialize(
-                row, sidecar_path, output_dir / "audio" / "prompts" / f"prompt-{number:02d}.wav"
-            ).model_dump(),
-        )
-        for number, row in enumerate(prompt_rows)
-    ]
-    benchmark_ids = _load_benchmark_ids(benchmark_path)
-    prompt_ids = [prompt.prompt_id for prompt in prompts]
-    assignments = {benchmark_id: validation_rng.choice(prompt_ids) for benchmark_id in benchmark_ids}
-    audio_log_ids = sorted(validation_rng.sample(benchmark_ids, _AUDIO_LOG_COUNT))
+        staging_dir = Path(mkdtemp(prefix=f".{output_dir.name}.build-", dir=output_dir.parent))
+        try:
+            memorization = [
+                _materialize(
+                    row,
+                    sidecar_path,
+                    output_dir / "audio" / "memorization" / f"item-{number:02d}.wav",
+                    staging_dir / "audio" / "memorization" / f"item-{number:02d}.wav",
+                )
+                for number, row in enumerate(memorization_rows)
+            ]
+            prompts = [
+                PromptSample(
+                    prompt_id=f"prompt-{number:02d}",
+                    **_materialize(
+                        row,
+                        sidecar_path,
+                        output_dir / "audio" / "prompts" / f"prompt-{number:02d}.wav",
+                        staging_dir / "audio" / "prompts" / f"prompt-{number:02d}.wav",
+                    ).model_dump(),
+                )
+                for number, row in enumerate(prompt_rows)
+            ]
+            benchmark_ids = _load_benchmark_ids(benchmark_path)
+            prompt_ids = [prompt.prompt_id for prompt in prompts]
+            assignments = {benchmark_id: validation_rng.choice(prompt_ids) for benchmark_id in benchmark_ids}
+            audio_log_ids = sorted(validation_rng.sample(benchmark_ids, _AUDIO_LOG_COUNT))
 
-    selection_fingerprint = fingerprint(
-        {
-            "schema_version": _SCHEMA_VERSION,
-            "seed": seed,
-            "index_fingerprint": index_fingerprint,
-            "memorization": [_sample_fingerprint_value(item) for item in memorization],
-            "prompts": [_sample_fingerprint_value(item) for item in prompts],
-            "benchmark_prompt_by_id": assignments,
-            "audio_log_ids": audio_log_ids,
-        }
-    )
-    bundle = SelectionBundle(
-        fingerprint=selection_fingerprint,
-        seed=seed,
-        memorization=memorization,
-        prompts=prompts,
-        benchmark_prompt_by_id=assignments,
-        audio_log_ids=audio_log_ids,
-    )
-    _publish_manifests(output_dir, bundle)
-    return bundle
+            selection_fingerprint = fingerprint(
+                {
+                    "schema_version": _SCHEMA_VERSION,
+                    "seed": seed,
+                    "index_fingerprint": index_fingerprint,
+                    "memorization": [_sample_fingerprint_value(item) for item in memorization],
+                    "prompts": [_sample_fingerprint_value(item) for item in prompts],
+                    "benchmark_prompt_by_id": assignments,
+                    "audio_log_ids": audio_log_ids,
+                }
+            )
+            bundle = SelectionBundle(
+                fingerprint=selection_fingerprint,
+                seed=seed,
+                memorization=memorization,
+                prompts=prompts,
+                benchmark_prompt_by_id=assignments,
+                audio_log_ids=audio_log_ids,
+            )
+            _write_staged_manifests(staging_dir, bundle)
+            _validate_staged_bundle(staging_dir, output_dir, bundle)
+            _publish_staged_bundle(staging_dir, output_dir)
+        except BaseException:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            raise
+        else:
+            shutil.rmtree(staging_dir)
+            return bundle
 
 
 def _open_index(path: Path) -> sqlite3.Connection:
@@ -235,17 +255,17 @@ def _reservoir(rows: Iterator[_Sample], size: int, rng: random.Random, label: st
     return sorted(reservoir, key=lambda row: getattr(row, "source_relative_path"))
 
 
-def _materialize(row: _IndexedSample, sidecar_path: Path, wav_path: Path) -> SelectedSample:
+def _materialize(row: _IndexedSample, sidecar_path: Path, wav_path: Path, staging_wav_path: Path) -> SelectedSample:
     text = _read_indexed_text(sidecar_path, row)
     audio = _read_range(row.source_tar_path, row.audio_offset, row.audio_size, "audio")
-    _write_decoded_wav(audio, wav_path)
+    _write_decoded_wav(audio, staging_wav_path)
     return SelectedSample(
         source_relative_path=row.source_relative_path,
         agreement=row.agreement,
         stage=row.stage,
         text=text,
         wav_path=wav_path,
-        wav_sha256=sha256_file(wav_path),
+        wav_sha256=sha256_file(staging_wav_path),
     )
 
 
@@ -344,16 +364,126 @@ def _sample_fingerprint_value(sample: SelectedSample) -> dict[str, object]:
     return value
 
 
-def _publish_manifests(output_dir: Path, bundle: SelectionBundle) -> None:
-    output_dir.mkdir(parents=True, exist_ok=True)
+def _write_staged_manifests(staging_dir: Path, bundle: SelectionBundle) -> None:
     common = {"schema_version": _SCHEMA_VERSION, "fingerprint": bundle.fingerprint, "seed": bundle.seed}
     atomic_json(
-        output_dir / "memorization.json",
+        staging_dir / "memorization.json",
         {**common, "memorization": [item.model_dump(mode="json") for item in bundle.memorization]},
     )
-    atomic_json(output_dir / "prompts.json", {**common, "prompts": [item.model_dump(mode="json") for item in bundle.prompts]})
+    atomic_json(staging_dir / "prompts.json", {**common, "prompts": [item.model_dump(mode="json") for item in bundle.prompts]})
     atomic_json(
-        output_dir / "benchmark-prompts.json",
+        staging_dir / "benchmark-prompts.json",
         {**common, "benchmark_prompt_by_id": bundle.benchmark_prompt_by_id},
     )
-    atomic_json(output_dir / "audio-log-ids.json", {**common, "audio_log_ids": bundle.audio_log_ids})
+    atomic_json(staging_dir / "audio-log-ids.json", {**common, "audio_log_ids": bundle.audio_log_ids})
+
+
+_PUBLISHED_PATHS = (
+    Path("audio"),
+    Path("memorization.json"),
+    Path("prompts.json"),
+    Path("benchmark-prompts.json"),
+    Path("audio-log-ids.json"),
+)
+
+
+def _validate_staged_bundle(staging_dir: Path, output_dir: Path, bundle: SelectionBundle) -> None:
+    manifest_names = {path.name for path in staging_dir.glob("*.json")}
+    expected_names = {path.name for path in _PUBLISHED_PATHS if path.suffix == ".json"}
+    if manifest_names != expected_names:
+        raise SelectionError("staged selection manifests are incomplete")
+    manifests: dict[str, dict[str, object]] = {}
+    for name in sorted(manifest_names):
+        try:
+            value = json.loads((staging_dir / name).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise SelectionError("staged selection manifest is malformed") from error
+        if not isinstance(value, dict):
+            raise SelectionError("staged selection manifest is malformed")
+        manifests[name] = value
+    if any(
+        value.get("schema_version") != _SCHEMA_VERSION
+        or value.get("fingerprint") != bundle.fingerprint
+        or value.get("seed") != bundle.seed
+        for value in manifests.values()
+    ):
+        raise SelectionError("staged selection manifests do not share a fingerprint")
+    if manifests["memorization.json"].get("memorization") != [item.model_dump(mode="json") for item in bundle.memorization]:
+        raise SelectionError("staged memorization manifest does not match selected samples")
+    if manifests["prompts.json"].get("prompts") != [item.model_dump(mode="json") for item in bundle.prompts]:
+        raise SelectionError("staged prompts manifest does not match selected samples")
+    expected_assignments = {str(key): value for key, value in bundle.benchmark_prompt_by_id.items()}
+    assignments = manifests["benchmark-prompts.json"].get("benchmark_prompt_by_id")
+    if assignments != expected_assignments or len(assignments) != _BENCHMARK_COUNT:
+        raise SelectionError("staged benchmark assignments are incomplete")
+    prompt_ids = {prompt.prompt_id for prompt in bundle.prompts}
+    if set(assignments.values()) - prompt_ids:
+        raise SelectionError("staged benchmark assignments reference an unknown prompt")
+    audio_log_ids = manifests["audio-log-ids.json"].get("audio_log_ids")
+    if audio_log_ids != bundle.audio_log_ids or len(set(audio_log_ids)) != _AUDIO_LOG_COUNT:
+        raise SelectionError("staged W&B audio log IDs are invalid")
+    if not set(audio_log_ids) <= set(bundle.benchmark_prompt_by_id):
+        raise SelectionError("staged W&B audio log IDs are not assigned benchmarks")
+    for sample in [*bundle.memorization, *bundle.prompts]:
+        try:
+            staged_wav_path = staging_dir / sample.wav_path.relative_to(output_dir)
+        except ValueError as error:
+            raise SelectionError("staged WAV path escapes the selection output directory") from error
+        if not staged_wav_path.is_file() or sha256_file(staged_wav_path) != sample.wav_sha256:
+            raise SelectionError("staged WAV hash does not match the selection manifest")
+
+
+def _publish_staged_bundle(staging_dir: Path, output_dir: Path) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    backup_dir = staging_dir / "backups"
+    backup_dir.mkdir()
+    backups: dict[Path, Path] = {}
+    installed: list[Path] = []
+    try:
+        for relative_path in _PUBLISHED_PATHS:
+            published_path = output_dir / relative_path
+            if published_path.exists() or published_path.is_symlink():
+                backup_path = backup_dir / relative_path
+                os.replace(published_path, backup_path)
+                backups[relative_path] = backup_path
+        for relative_path in _PUBLISHED_PATHS:
+            os.replace(staging_dir / relative_path, output_dir / relative_path)
+            installed.append(relative_path)
+    except BaseException:
+        for relative_path in reversed(installed):
+            _remove_path(output_dir / relative_path)
+        for relative_path, backup_path in backups.items():
+            os.replace(backup_path, output_dir / relative_path)
+        raise
+
+
+def _remove_path(path: Path) -> None:
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    else:
+        path.unlink(missing_ok=True)
+
+
+class _SelectionBuildLock:
+    """Nonblocking lock that serializes construction of one output bundle."""
+
+    def __init__(self, output_dir: Path) -> None:
+        self._path = output_dir.parent / f".{output_dir.name}.selection.lock"
+        self._descriptor: int | None = None
+
+    def __enter__(self) -> "_SelectionBuildLock":
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._descriptor = os.open(self._path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(self._descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            os.close(self._descriptor)
+            self._descriptor = None
+            raise SelectionError("another selection build is already active for this output directory") from error
+        return self
+
+    def __exit__(self, _type: object, _value: object, _traceback: object) -> None:
+        if self._descriptor is not None:
+            fcntl.flock(self._descriptor, fcntl.LOCK_UN)
+            os.close(self._descriptor)
+            self._descriptor = None

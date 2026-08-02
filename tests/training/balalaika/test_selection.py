@@ -13,6 +13,7 @@ import wave
 import pytest
 
 from voxcpm.training.balalaika.artifacts import sha256_file
+from voxcpm.training.balalaika import selection as selection_module
 from voxcpm.training.balalaika.selection import SelectionError, create_selection_manifests
 
 
@@ -187,3 +188,58 @@ def test_selection_fails_when_fewer_than_twenty_usable_prompt_rows(tmp_path: Pat
 
     with pytest.raises(SelectionError, match="at least 20 usable prompt rows"):
         create_selection_manifests(**fixture.kwargs, seed=29)
+
+
+def _published_files(output_dir: Path) -> dict[str, str]:
+    return {
+        path.relative_to(output_dir).as_posix(): sha256_file(path)
+        for path in sorted(output_dir.rglob("*"))
+        if path.is_file()
+    }
+
+
+def _assert_complete_published_bundle(output_dir: Path) -> None:
+    manifests = {
+        path.name: json.loads(path.read_text(encoding="utf-8"))
+        for path in output_dir.glob("*.json")
+    }
+    assert set(manifests) == {"memorization.json", "prompts.json", "benchmark-prompts.json", "audio-log-ids.json"}
+    assert len({payload["fingerprint"] for payload in manifests.values()}) == 1
+    for kind in ("memorization", "prompts"):
+        for sample in manifests[f"{kind}.json"][kind]:
+            wav_path = Path(sample["wav_path"])
+            assert wav_path.is_file()
+            assert sample["wav_sha256"] == sha256_file(wav_path)
+
+
+def test_failed_publication_restores_the_prior_complete_bundle(selection_fixture, monkeypatch):
+    """Catches a partial replacement that leaves old manifests pointing at new selected WAVs."""
+    create_selection_manifests(**selection_fixture.kwargs, seed=29)
+    before = _published_files(selection_fixture.output_dir)
+    _assert_complete_published_bundle(selection_fixture.output_dir)
+    replace = selection_module.os.replace
+    failed = False
+
+    def fail_before_replacing_prompts(source, destination):
+        nonlocal failed
+        if not failed and Path(destination) == selection_fixture.output_dir / "prompts.json":
+            failed = True
+            raise OSError("injected manifest publish failure")
+        return replace(source, destination)
+
+    monkeypatch.setattr(selection_module.os, "replace", fail_before_replacing_prompts)
+
+    with pytest.raises(OSError, match="injected manifest publish failure"):
+        create_selection_manifests(**selection_fixture.kwargs, seed=31)
+
+    assert _published_files(selection_fixture.output_dir) == before
+    _assert_complete_published_bundle(selection_fixture.output_dir)
+    assert not [path for path in selection_fixture.output_dir.rglob("*") if path.name.startswith(".")]
+    assert not list(selection_fixture.output_dir.parent.glob(f".{selection_fixture.output_dir.name}.build-*"))
+
+
+def test_selection_rejects_a_concurrent_builder(selection_fixture):
+    """Catches two builders interleaving writes beneath one published selection directory."""
+    with selection_module._SelectionBuildLock(selection_fixture.output_dir):
+        with pytest.raises(SelectionError, match="another selection build"):
+            create_selection_manifests(**selection_fixture.kwargs, seed=29)
