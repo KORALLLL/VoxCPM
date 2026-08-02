@@ -237,7 +237,8 @@ def normalize_ru(text: str) -> str:
     meaningful combining marks such as the breve in ``й``, punctuation/symbols
     become token boundaries, and all whitespace is collapsed.
     """
-    decomposed = unicodedata.normalize("NFD", text.casefold().replace("ё", "е"))
+    canonical = unicodedata.normalize("NFC", text).casefold().replace("ё", "е")
+    decomposed = unicodedata.normalize("NFD", canonical)
     without_stress = "".join(character for character in decomposed if character not in _STRESS_MARKS)
     normalized = unicodedata.normalize("NFC", without_stress)
     tokenizable = "".join(

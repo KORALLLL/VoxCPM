@@ -25,6 +25,15 @@ def test_normalize_ru_shares_case_yo_stress_whitespace_and_punctuation_rules() -
     assert normalize_ru("  Ёлка,\tЕЩЁ!  со́рок—два...\n") == "елка еще сорок два"
 
 
+@pytest.mark.parametrize("text", ("ё", "Ё", "е\u0308", "Е\u0308"))
+def test_normalize_ru_folds_precomposed_and_decomposed_yo_to_e(text: str) -> None:
+    assert normalize_ru(text) == "е"
+
+
+def test_normalize_ru_removes_stress_without_stripping_breve() -> None:
+    assert normalize_ru("й и\u0306 и\u0301") == "й й и"
+
+
 def test_micro_cer_uses_character_denominator_not_word_count() -> None:
     rows = [
         BenchmarkRow(
