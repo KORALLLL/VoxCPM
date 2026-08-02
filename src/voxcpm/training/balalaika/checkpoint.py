@@ -32,7 +32,7 @@ class CheckpointRestoreError(CheckpointError):
 class CheckpointManager:
     """Publish and restore immutable boundary checkpoints beneath one root."""
 
-    _SCHEMA_VERSION = 2
+    _SCHEMA_VERSION = 3
     _ADAPTER_FILE = "adapter_model.safetensors"
     _METADATA_FILE = "metadata.json"
     _MANIFEST_FILE = "manifest.json"
@@ -75,6 +75,7 @@ class CheckpointManager:
         }
     )
     _SUPPORTED_DISTRIBUTED_TYPES = frozenset({"NO", "MULTI_CPU", "MULTI_GPU"})
+    _CHECKPOINT_KINDS = frozenset({"boundary", "recovery"})
 
     def __init__(self, root: Path):
         self.root = Path(root)
@@ -91,11 +92,52 @@ class CheckpointManager:
         name: str | None = None,
     ) -> Path:
         """Save adapter plus same-stage Accelerate state, then publish atomically."""
+        return self._save_checkpoint(
+            accelerator,
+            model,
+            progress,
+            metadata,
+            checkpoint_kind="boundary",
+            name=name,
+        )
+
+    def save_recovery(
+        self,
+        accelerator: Any,
+        model: Any,
+        progress: TrainingProgress,
+        metadata: Mapping[str, Any],
+        *,
+        name: str | None = None,
+    ) -> Path:
+        """Save a synchronized same-stage recovery after a complete accumulation group."""
+        return self._save_checkpoint(
+            accelerator,
+            model,
+            progress,
+            metadata,
+            checkpoint_kind="recovery",
+            name=name,
+        )
+
+    def _save_checkpoint(
+        self,
+        accelerator: Any,
+        model: Any,
+        progress: TrainingProgress,
+        metadata: Mapping[str, Any],
+        *,
+        checkpoint_kind: str,
+        name: str | None,
+    ) -> Path:
         self._ensure_usable()
         self._ensure_supported_accelerator(accelerator)
-        complete_metadata = self._build_metadata(progress, metadata)
+        complete_metadata = self._build_metadata(progress, metadata, checkpoint_kind=checkpoint_kind)
         self._validate_accelerator_world_size(accelerator, complete_metadata["world_size"])
-        checkpoint_name = name or self._checkpoint_name(progress)
+        default_name = (
+            self._checkpoint_name(progress) if checkpoint_kind == "boundary" else self._recovery_name(progress)
+        )
+        checkpoint_name = name or default_name
         self._validate_checkpoint_name(checkpoint_name)
         destination = self.root / checkpoint_name
         temporary = self.root / f".{checkpoint_name}.tmp"
@@ -209,6 +251,8 @@ class CheckpointManager:
             },
         }
         metadata = self.verify(checkpoint, compatible_expected)
+        if metadata["checkpoint_kind"] != "boundary":
+            raise CheckpointMismatch("stage transition requires a final stage1 boundary checkpoint, not recovery")
         if (
             not self._is_stage_one(metadata["stage"])
             or metadata["boundary"] != 8
@@ -278,17 +322,27 @@ class CheckpointManager:
             raise CheckpointError("latest pointer fingerprint mismatch")
         return checkpoint
 
-    def _build_metadata(self, progress: TrainingProgress, supplied: Mapping[str, Any]) -> dict[str, Any]:
+    def _build_metadata(
+        self,
+        progress: TrainingProgress,
+        supplied: Mapping[str, Any],
+        *,
+        checkpoint_kind: str,
+    ) -> dict[str, Any]:
         supplied = dict(supplied)
         supplied.pop("rng_state", None)
-        conflicting = self._PROGRESS_FIELDS.intersection(supplied)
+        conflicting = (self._PROGRESS_FIELDS | {"checkpoint_kind", "accumulation_microstep"}).intersection(supplied)
         if conflicting:
             raise CheckpointError(f"progress metadata is manager-owned: {sorted(conflicting)}")
         missing = sorted(self._REQUIRED_SUPPLIED_METADATA - set(supplied))
         if missing:
             raise CheckpointError(f"checkpoint metadata is missing required fields: {missing}")
+        if checkpoint_kind not in self._CHECKPOINT_KINDS:
+            raise CheckpointError(f"unsupported checkpoint kind: {checkpoint_kind!r}")
         value: dict[str, Any] = {
             "schema_version": self._SCHEMA_VERSION,
+            "checkpoint_kind": checkpoint_kind,
+            "accumulation_microstep": progress.microstep % supplied["accumulation"],
             **supplied,
             **{key: item for key, item in progress.state_dict().items() if key != "schema_version"},
         }
@@ -314,7 +368,15 @@ class CheckpointManager:
         require_rng: bool = True,
         require_fingerprint: bool = True,
     ) -> None:
-        required = self._REQUIRED_SUPPLIED_METADATA | self._PROGRESS_FIELDS | {"schema_version"}
+        required = (
+            self._REQUIRED_SUPPLIED_METADATA
+            | self._PROGRESS_FIELDS
+            | {
+                "schema_version",
+                "checkpoint_kind",
+                "accumulation_microstep",
+            }
+        )
         if require_rng:
             required = required | {"rng_state"}
         if require_fingerprint:
@@ -324,6 +386,15 @@ class CheckpointManager:
             raise CheckpointError(f"checkpoint metadata is missing required fields: {missing}")
         if metadata["schema_version"] != self._SCHEMA_VERSION:
             raise CheckpointError(f"unsupported checkpoint schema_version: {metadata['schema_version']!r}")
+        if metadata["checkpoint_kind"] not in self._CHECKPOINT_KINDS:
+            raise CheckpointError(f"unsupported checkpoint kind: {metadata['checkpoint_kind']!r}")
+        accumulation_microstep = metadata["accumulation_microstep"]
+        if (
+            isinstance(accumulation_microstep, bool)
+            or not isinstance(accumulation_microstep, int)
+            or accumulation_microstep < 0
+        ):
+            raise CheckpointError("checkpoint metadata accumulation_microstep must be a non-negative integer")
         for name in (
             "stage_epochs",
             "world_size",
@@ -538,10 +609,15 @@ class CheckpointManager:
             raise CheckpointError("checkpoint metadata optimizer_step is outside the active epoch")
         boundaries = tuple((fraction * steps_per_epoch + 7) // 8 for fraction in range(1, 9))
         reached = sum(step <= epoch_step for step in boundaries)
-        if progress.boundary != reached or progress.optimizer_step != epoch_start + boundaries[reached - 1]:
-            raise CheckpointError(
-                "checkpoint metadata boundary does not match the completed optimizer_step boundary cursor"
-            )
+        if metadata["checkpoint_kind"] == "boundary":
+            if progress.boundary != reached or progress.optimizer_step != epoch_start + boundaries[reached - 1]:
+                raise CheckpointError(
+                    "checkpoint metadata boundary does not match the completed optimizer_step boundary cursor"
+                )
+        elif progress.boundary != reached:
+            raise CheckpointError("recovery checkpoint boundary cursor does not match the completed optimizer_step")
+        if metadata["accumulation_microstep"] != 0:
+            raise CheckpointError("checkpoint requires a complete accumulation group with accumulation_microstep=0")
         expected_microstep = progress.optimizer_step * metadata["accumulation"]
         if progress.microstep != expected_microstep:
             raise CheckpointError(
@@ -645,6 +721,10 @@ class CheckpointManager:
     @staticmethod
     def _checkpoint_name(progress: TrainingProgress) -> str:
         return f"{progress.stage}-epoch-{progress.epoch + 1:04d}-boundary-{progress.boundary:02d}"
+
+    @staticmethod
+    def _recovery_name(progress: TrainingProgress) -> str:
+        return f"{progress.stage}-epoch-{progress.epoch + 1:04d}-recovery-step-{progress.optimizer_step:010d}"
 
     @staticmethod
     def _validate_checkpoint_name(name: str) -> None:

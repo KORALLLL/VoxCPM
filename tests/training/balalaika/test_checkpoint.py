@@ -707,5 +707,112 @@ def test_stage2_requires_complete_source_identity_before_mutation(tmp_path):
             path,
             expected={key: value for key, value in stage2_expected().items() if key != "selection_fingerprint"},
         )
-
     assert not target.loaded_lora
+
+
+def test_recovery_checkpoint_accepts_only_complete_accumulation_geometry(tmp_path):
+    model = FakeModel()
+    accelerator = FakeAccelerator(model)
+    manager = CheckpointManager(tmp_path)
+    progress = TrainingProgress(
+        stage="stage1",
+        epoch=0,
+        boundary=1,
+        microstep=44,
+        optimizer_step=11,
+        global_step=11,
+        sampler_seed=7,
+        sampler_epoch=0,
+    )
+
+    metadata_input = checkpoint_metadata(optimizer_steps_per_epoch=80)
+    path = manager.save_recovery(accelerator, model, progress, metadata_input)
+    metadata = manager.verify(path, {"checkpoint_kind": "recovery"})
+
+    assert path.name == "stage1-epoch-0001-recovery-step-0000000011"
+    assert metadata["checkpoint_kind"] == "recovery"
+    assert metadata["accumulation_microstep"] == 0
+    assert metadata["optimizer_step"] == 11
+    assert metadata["boundary"] == 1
+
+    incomplete = TrainingProgress(
+        stage="stage1",
+        epoch=0,
+        boundary=1,
+        microstep=45,
+        optimizer_step=11,
+        global_step=11,
+        sampler_seed=7,
+        sampler_epoch=0,
+    )
+    with pytest.raises(CheckpointError, match="complete accumulation"):
+        manager.save_recovery(accelerator, model, incomplete, metadata_input)
+
+
+def test_boundary_save_still_rejects_non_eighth_optimizer_step(tmp_path):
+    progress = TrainingProgress(
+        stage="stage1",
+        epoch=0,
+        boundary=1,
+        microstep=44,
+        optimizer_step=11,
+        global_step=11,
+        sampler_seed=7,
+        sampler_epoch=0,
+    )
+
+    with pytest.raises(CheckpointError, match="boundary"):
+        save_checkpoint(tmp_path, progress=progress)
+
+
+def test_same_stage_resume_restores_recovery_before_next_microbatch(tmp_path):
+    model = FakeModel()
+    manager = CheckpointManager(tmp_path)
+    progress = TrainingProgress(
+        stage="stage1",
+        epoch=0,
+        boundary=1,
+        microstep=44,
+        optimizer_step=11,
+        global_step=11,
+        sampler_seed=7,
+        sampler_epoch=0,
+    )
+    path = manager.save_recovery(
+        FakeAccelerator(model),
+        model,
+        progress,
+        checkpoint_metadata(optimizer_steps_per_epoch=80),
+    )
+    target = FakeModel()
+    restored = TrainingProgress(stage="stage1")
+
+    metadata = manager.resume_same_stage(
+        FakeAccelerator(target),
+        target,
+        restored,
+        path,
+        expected=same_stage_expected(optimizer_steps_per_epoch=80),
+    )
+
+    assert metadata["checkpoint_kind"] == "recovery"
+    assert restored.state_dict() == progress.state_dict()
+
+
+def test_stage2_adapter_transition_rejects_recovery_checkpoint(tmp_path):
+    model = FakeModel()
+    manager = CheckpointManager(tmp_path)
+    progress = TrainingProgress(
+        stage="stage1",
+        epoch=1,
+        boundary=8,
+        microstep=128,
+        optimizer_step=32,
+        global_step=32,
+        sampler_seed=7,
+        sampler_epoch=1,
+    )
+    path = manager.save_recovery(FakeAccelerator(model), model, progress, checkpoint_metadata())
+
+    with pytest.raises(CheckpointMismatch, match="boundary checkpoint"):
+        manager.load_stage_adapter(FakeModel(), path, expected=stage2_expected())
