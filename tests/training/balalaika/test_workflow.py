@@ -163,6 +163,38 @@ def _refresh_declared_index_hash(config: BalalaikaConfig) -> None:
     audit_path.write_text(json.dumps(audit), encoding="utf-8")
 
 
+def test_benchmark_loader_accepts_pinned_rows_with_additional_metadata(tmp_path):
+    """Catches the production benchmark's descriptive fields being splatted into the scoring dataclass."""
+    benchmark = tmp_path / "hard_number_eval.jsonl"
+    benchmark.write_text(
+        "".join(
+            json.dumps(
+                {
+                    "id": identifier,
+                    "category": "agree",
+                    "hard_number": "1004",
+                    "why_hard": "agreement",
+                    "text": f"номер {identifier}",
+                    "normalized_runorm": str(identifier),
+                    "normalized_gold": str(identifier),
+                    "runorm_wrong": False,
+                    "error_type": "",
+                    "stressed": f"номер {identifier}",
+                }
+            )
+            + "\n"
+            for identifier in range(1, 2_001)
+        ),
+        encoding="utf-8",
+    )
+
+    rows = workflow_module._load_benchmark_rows(benchmark)
+
+    assert len(rows) == 2_000
+    assert rows[0].id == 1
+    assert rows[-1].id == 2_000
+
+
 def test_deep_audit_rejects_sqlite_stage_tampering_with_preserved_declarations(prepared_deep_audit):
     """Catches audit trusting declared stage totals and a refreshed self-declared index hash."""
     commands = ProductionCommands()

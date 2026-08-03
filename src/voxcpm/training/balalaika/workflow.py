@@ -908,8 +908,17 @@ def _load_benchmark_rows(path: Path) -> tuple[BenchmarkRow, ...]:
             for line_number, line in enumerate(source, start=1):
                 try:
                     value = json.loads(line)
-                    rows.append(BenchmarkRow(**_mapping(value, f"benchmark row {line_number}")))
-                except (json.JSONDecodeError, TypeError, ValueError) as error:
+                    row = _mapping(value, f"benchmark row {line_number}")
+                    rows.append(
+                        BenchmarkRow(
+                            id=row["id"],
+                            category=row["category"],
+                            text=row["text"],
+                            normalized_gold=row["normalized_gold"],
+                            stressed=row["stressed"],
+                        )
+                    )
+                except (KeyError, json.JSONDecodeError, TypeError, ValueError) as error:
                     raise ValueError(f"benchmark row {line_number} is malformed") from error
     except OSError as error:
         raise ValueError(f"cannot read pinned benchmark {path}: {error}") from error
