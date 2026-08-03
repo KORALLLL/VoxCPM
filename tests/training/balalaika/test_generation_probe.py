@@ -207,6 +207,26 @@ def test_probe_refuses_output_inside_checkpoint_or_prepared_inputs(tmp_path, mon
         assert not output.exists()
 
 
+def test_probe_refuses_output_beneath_resolved_hub_before_loading_model_or_checkpoint(tmp_path, monkeypatch):
+    """Catches the diagnostic writing into pin-bound model, benchmark, or GigaAM state."""
+    config, checkpoint, _samples = _fixture(tmp_path)
+    hub_root = Path(config.hub.local_dir)
+    config.hub.local_dir = hub_root / ".." / hub_root.name
+    output = config.hub.local_dir / "model" / "probe.wav"
+    monkeypatch.setattr(probe, "_require_one_cuda_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(probe, "build_model", lambda *args, **kwargs: pytest.fail("model load must not run"))
+    monkeypatch.setattr(
+        probe,
+        "CheckpointManager",
+        lambda *args, **kwargs: pytest.fail("checkpoint load must not run"),
+    )
+
+    with pytest.raises(probe.GenerationProbeError, match="protected hub"):
+        probe.run_probe(config, checkpoint, output, gigaam=False)
+
+    assert not output.exists()
+
+
 def test_probe_optionally_reports_gigaam_without_changing_generation_result(tmp_path, monkeypatch):
     """Catches the optional ASR diagnostic being omitted or gating a valid generated WAV."""
     config, checkpoint, _samples = _fixture(tmp_path)

@@ -153,6 +153,7 @@ def _require_safe_output(config: Any, checkpoint: Path, output: Path) -> None:
         "corpus": Path(config.data.corpus_root).resolve(),
         "index": Path(config.data.index_dir).resolve(),
         "selection": Path(config.selection_dir).resolve(),
+        "hub": Path(config.hub.local_dir).resolve(),
     }
     for label, root in protected.items():
         if output == root or root in output.parents:
