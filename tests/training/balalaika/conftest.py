@@ -114,9 +114,10 @@ class SyntheticCorpus:
             with tarfile.open(train / f"shard_{shard}.tar", "w") as archive:
                 for row in rows:
                     identity = str(row["source_relative_path"])
+                    member_name = identity.rsplit("/", maxsplit=1)[-1]
                     _tar_member(
                         archive,
-                        identity.removesuffix(".wav") + ".json",
+                        member_name.removesuffix(".wav") + ".json",
                         json.dumps(
                             {
                                 "source_relative_path": identity,
@@ -126,7 +127,7 @@ class SyntheticCorpus:
                         ).encode(),
                     )
                     if row.get("include_audio", True):
-                        _tar_member(archive, identity, _wav_bytes())
+                        _tar_member(archive, member_name, _wav_bytes())
 
     def _write_rover(self) -> None:
         self.rover_archive.parent.mkdir(parents=True, exist_ok=True)

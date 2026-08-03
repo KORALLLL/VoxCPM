@@ -71,10 +71,19 @@ def load_build_expectations(config: DataConfig) -> BuildExpectations:
         _require_sha256(digest, f"source shard {name}")
         if isinstance(samples, bool) or not isinstance(samples, int) or samples <= 0:
             raise ValueError(f"source shard {name} has an invalid sample count")
+        manifest_path = Path(config.corpus_root) / "manifests" / Path(name).with_suffix(".json").name
+        manifest = _read_json(manifest_path, f"augmented shard manifest {name}")
+        shard_id = name.removeprefix("shard_").removesuffix(".tar")
+        if manifest.get("shard_id") != shard_id or manifest.get("samples") != samples:
+            raise ValueError(f"augmented shard manifest does not match verified shard {name}")
+        if manifest.get("source_sha256") != digest:
+            raise ValueError(f"augmented shard manifest is not bound to verified source {name}")
+        augmented_digest = manifest.get("sha256")
+        _require_sha256(augmented_digest, f"augmented shard {name}")
         relative = f"train/{name}"
         if relative in source_hashes:
             raise ValueError(f"corpus verification contains duplicate shard {name}")
-        source_hashes[relative] = digest
+        source_hashes[relative] = augmented_digest
         source_rows += samples
     declared_rows = stats.get("samples")
     if declared_rows != config.expected_rows or source_rows != config.expected_rows:

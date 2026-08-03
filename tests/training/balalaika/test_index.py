@@ -12,7 +12,7 @@ from voxcpm.training.balalaika.index import IndexIntegrityError, build_index
 
 
 def test_build_index_joins_by_identity_and_splits_exact_boundary(synthetic_corpus):
-    """Catches a non-strict identity join or an incorrect 0.95 stage boundary."""
+    """Catches rejecting basename tar members whose JSON carries the canonical shard identity."""
     audit = build_index(synthetic_corpus.config, synthetic_corpus.expectations)
 
     with sqlite3.connect(audit.index_path) as db:
@@ -115,6 +115,17 @@ def test_build_index_rejects_empty_combined_text(synthetic_corpus):
 
     with pytest.raises(IndexIntegrityError, match="empty combined text"):
         build_index(synthetic_corpus.config, synthetic_corpus.expectations)
+
+
+def test_build_index_allows_empty_combined_text_for_null_agreement_exclusion(synthetic_corpus):
+    """Catches rejecting absent text for a row already excluded by its audited null agreement."""
+    synthetic_corpus.replace_text("000001/c.wav", "")
+
+    audit = build_index(synthetic_corpus.config, synthetic_corpus.expectations)
+
+    assert audit.total_rows == 3
+    assert audit.eligible_rows == 2
+    assert audit.excluded_null_agreement == 1
 
 
 def test_build_index_rejects_incorrect_combined_sidecar_sha256(synthetic_corpus):

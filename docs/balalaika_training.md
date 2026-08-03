@@ -73,7 +73,7 @@ the audit pass; reconcile the corpus provenance first.
 Launch the four-example diagnostic on eight processes:
 
 ```bash
-rtk accelerate launch --num_processes 8 -m voxcpm.training.balalaika.cli --config conf/voxcpm_v2/balalaika_lora.yaml memorize
+rtk uv run accelerate launch --num_processes 8 -m voxcpm.training.balalaika.cli --config conf/voxcpm_v2/balalaika_lora.yaml memorize
 ```
 
 The command trains only the fixed four examples, logs the four reference and
@@ -97,7 +97,7 @@ Stage 1 re-verifies approval before runtime, model, or dataset setup and
 rejects any process count other than eight. Launch it with:
 
 ```bash
-rtk accelerate launch --num_processes 8 -m voxcpm.training.balalaika.cli --config conf/voxcpm_v2/balalaika_lora.yaml train --stage 1
+rtk uv run accelerate launch --num_processes 8 -m voxcpm.training.balalaika.cli --config conf/voxcpm_v2/balalaika_lora.yaml train --stage 1
 ```
 
 Stage 1 has two epochs and therefore 16 exact one-eighth-epoch validation and
@@ -107,7 +107,7 @@ loads only its LoRA weights, resets optimizer/scheduler state, and runs three
 epochs with 24 validation boundaries:
 
 ```bash
-rtk accelerate launch --num_processes 8 -m voxcpm.training.balalaika.cli --config conf/voxcpm_v2/balalaika_lora.yaml train --stage 2 --stage1-checkpoint /workspace/balalaika_lora_training/runs/stage1/checkpoints/FINAL_CHECKPOINT
+rtk uv run accelerate launch --num_processes 8 -m voxcpm.training.balalaika.cli --config conf/voxcpm_v2/balalaika_lora.yaml train --stage 2 --stage1-checkpoint /workspace/balalaika_lora_training/runs/stage1/checkpoints/FINAL_CHECKPOINT
 ```
 
 After reviewing the selected final checkpoint, the canonical command may omit
@@ -115,19 +115,19 @@ the explicit path; the CLI then resolves `stage1/checkpoints/latest.json` and
 still verifies that it names the completed epoch-2 boundary-8 adapter:
 
 ```bash
-rtk accelerate launch --num_processes 8 -m voxcpm.training.balalaika.cli --config conf/voxcpm_v2/balalaika_lora.yaml train --stage 2
+rtk uv run accelerate launch --num_processes 8 -m voxcpm.training.balalaika.cli --config conf/voxcpm_v2/balalaika_lora.yaml train --stage 2
 ```
 
 Before a restart, verify a checkpoint against current pinned/data identities:
 
 ```bash
-rtk accelerate launch --num_processes 8 -m voxcpm.training.balalaika.cli --config conf/voxcpm_v2/balalaika_lora.yaml validate --checkpoint CHECKPOINT
+rtk uv run accelerate launch --num_processes 8 -m voxcpm.training.balalaika.cli --config conf/voxcpm_v2/balalaika_lora.yaml validate --checkpoint CHECKPOINT
 ```
 
 Resume the same stage with the exact prior checkpoint and unchanged config:
 
 ```bash
-rtk accelerate launch --num_processes 8 -m voxcpm.training.balalaika.cli --config conf/voxcpm_v2/balalaika_lora.yaml train --stage 1 --resume CHECKPOINT
+rtk uv run accelerate launch --num_processes 8 -m voxcpm.training.balalaika.cli --config conf/voxcpm_v2/balalaika_lora.yaml train --stage 1 --resume CHECKPOINT
 ```
 
 For stage 2, use `--stage 2 --resume CHECKPOINT`; do not also pass a stage-1
@@ -153,9 +153,9 @@ Implementation verification is intentionally limited to synthetic CPU tests
 and the documented synthetic GPU smoke script:
 
 ```bash
-rtk accelerate launch --num_processes 1 scripts/smoke_balalaika_accelerate.py --mode train-checkpoint
-rtk accelerate launch --num_processes 8 scripts/smoke_balalaika_accelerate.py --mode train-checkpoint
-rtk accelerate launch --num_processes 8 scripts/smoke_balalaika_accelerate.py --mode validation --items 32
+rtk uv run accelerate launch --num_processes 1 scripts/smoke_balalaika_accelerate.py --mode train-checkpoint
+rtk uv run accelerate launch --num_processes 8 scripts/smoke_balalaika_accelerate.py --mode train-checkpoint
+rtk uv run accelerate launch --num_processes 8 scripts/smoke_balalaika_accelerate.py --mode validation --items 32
 ```
 
 Those commands do not load production corpus rows or VoxCPM2 weights. No real

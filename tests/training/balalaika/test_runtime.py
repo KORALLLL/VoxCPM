@@ -52,6 +52,9 @@ class FakeAccelerator:
     def load_state(self, input_dir):
         self.calls.append(("load", input_dir))
 
+    def end_training(self):
+        self.calls.append(("end_training",))
+
 
 def runtime_config(accumulation=4):
     return SimpleNamespace(accumulation=accumulation)
@@ -125,6 +128,15 @@ def test_runtime_forwards_only_public_training_and_state_operations(tmp_path):
         "barrier",
         "load",
     ]
+
+
+def test_runtime_closes_the_accelerate_process_group_through_its_public_lifecycle():
+    """Catches distributed workers exiting without Accelerate process-group teardown."""
+    runtime = AccelerateRuntime.create(runtime_config(), accelerator_cls=FakeAccelerator)
+
+    runtime.close()
+
+    assert runtime.accelerator.calls == [("end_training",)]
 
 
 def test_save_waits_until_main_process_finishes_shared_checkpoint_files(tmp_path):

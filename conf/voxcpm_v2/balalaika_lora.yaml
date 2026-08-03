@@ -15,7 +15,7 @@ hub:
   benchmark_repo_id: bitmanagerai/hard_number_eval_for_tts
   gigaam_repo_id: istupakov/gigaam-v3-onnx
   local_dir: /workspace/balalaika_lora_training/hub
-  benchmark_file: data.jsonl
+  benchmark_file: hard_number_eval.jsonl
 
 lora:
   enable_lm: true

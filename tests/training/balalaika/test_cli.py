@@ -100,6 +100,14 @@ def _file_hashes(root: Path) -> dict[str, str]:
     }
 
 
+def test_runbook_uses_project_accelerate_launcher():
+    repository_root = Path(__file__).resolve().parents[3]
+    runbook = (repository_root / "docs" / "balalaika_training.md").read_text(encoding="utf-8")
+
+    assert "rtk accelerate launch" not in runbook
+    assert "rtk uv run accelerate launch" in runbook
+
+
 @pytest.mark.parametrize("command", ["pin", "prepare", "audit"])
 def test_non_distributed_commands_route_to_the_named_operation(config_path, command, capsys):
     """Catches a subparser dispatching a safe command to the wrong operation."""
@@ -256,8 +264,8 @@ def test_audit_surfaces_production_null_row_expectation(config_path, capsys):
     assert payload["excluded_null_agreement"] == 309
 
 
-def test_load_build_expectations_binds_every_verified_shard(tmp_path):
-    """Catches preparation trusting row totals without binding the complete source inventory."""
+def test_load_build_expectations_binds_every_augmented_shard_to_its_verified_source(tmp_path):
+    """Catches hashing augmented tar files against their pre-augmentation source digests."""
     corpus = tmp_path / "corpus"
     corpus.mkdir()
     verification = corpus / "verification.json"
@@ -274,6 +282,24 @@ def test_load_build_expectations_binds_every_verified_shard(tmp_path):
         ),
         encoding="utf-8",
     )
+    manifests = corpus / "manifests"
+    manifests.mkdir()
+    for shard, source_digest, augmented_digest, samples in (
+        ("000000", "a" * 64, "e" * 64, 2),
+        ("000001", "b" * 64, "f" * 64, 1),
+    ):
+        (manifests / f"shard_{shard}.json").write_text(
+            json.dumps(
+                {
+                    "shard_id": shard,
+                    "samples": samples,
+                    "members": samples * 2,
+                    "source_sha256": source_digest,
+                    "sha256": augmented_digest,
+                }
+            ),
+            encoding="utf-8",
+        )
     combined = corpus / "combined.meta.json"
     combined.write_text(
         json.dumps(
@@ -306,8 +332,8 @@ def test_load_build_expectations_binds_every_verified_shard(tmp_path):
     assert expectations.source_shard_count == 2
     assert expectations.source_row_count == expectations.rover_row_count == expectations.combined_row_count == 3
     assert expectations.source_tar_sha256 == {
-        "train/shard_000000.tar": "a" * 64,
-        "train/shard_000001.tar": "b" * 64,
+        "train/shard_000000.tar": "e" * 64,
+        "train/shard_000001.tar": "f" * 64,
     }
     assert expectations.rover_archive_sha256 == "c" * 64
     assert expectations.combined_sidecar_sha256 == "d" * 64
@@ -363,6 +389,51 @@ def test_production_prepare_builds_index_then_fixed_selection(config_path, tmp_p
     assert result.values["memorization_samples"] == 4
     assert result.values["validation_prompts"] == 20
     assert result.values["benchmark_assignments"] == 2_000
+
+
+def test_production_config_routes_the_pinned_hard_number_benchmark(tmp_path):
+    """Catches preparation assuming a benchmark filename absent from the pinned dataset revision."""
+    root = Path(__file__).resolve().parents[3]
+    config = BalalaikaConfig.load(root / "conf" / "voxcpm_v2" / "balalaika_lora.yaml")
+    hub_root = tmp_path / "hub"
+    benchmark = hub_root / "benchmark" / "hard_number_eval.jsonl"
+    benchmark.parent.mkdir(parents=True)
+    benchmark.write_text('{"id": 0}\n', encoding="utf-8")
+    config = config.model_copy(update={"hub": config.hub.model_copy(update={"local_dir": hub_root})})
+    audit = SimpleNamespace(
+        index_path=tmp_path / "balalaika-index.sqlite3",
+        audit_path=tmp_path / "balalaika-index-audit.json",
+        fingerprint="index-fingerprint",
+        total_rows=4_075_032,
+        eligible_rows=4_074_723,
+        stage1_rows=1_000_000,
+        stage2_rows=3_074_723,
+        excluded_null_agreement=309,
+    )
+    selection = SimpleNamespace(
+        fingerprint="selection-fingerprint",
+        memorization=[1, 2, 3, 4],
+        prompts=list(range(20)),
+        benchmark_prompt_by_id={item: "prompt-00" for item in range(2_000)},
+    )
+    selected_paths: list[Path] = []
+
+    def selection_builder(index_path, benchmark_path, output_dir, seed):
+        del index_path, output_dir, seed
+        benchmark_path = Path(benchmark_path)
+        benchmark_path.read_text(encoding="utf-8")
+        selected_paths.append(benchmark_path)
+        return selection
+
+    commands = ProductionCommands(
+        expectation_loader=lambda data: "trusted-expectations",
+        index_builder=lambda data, expectations: audit,
+        selection_builder=selection_builder,
+    )
+
+    commands.prepare(config)
+
+    assert selected_paths == [benchmark]
 
 
 def test_checked_in_config_loads_complete_operator_defaults():

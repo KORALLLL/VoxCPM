@@ -367,6 +367,8 @@ def _run_train_checkpoint() -> None:
             "checkpoint": str(checkpoint),
         }
         print("SMOKE_RESULT " + json.dumps(summary, sort_keys=True), flush=True)
+    runtime.barrier()
+    runtime.close()
 
 
 def _run_probe_rank_fault() -> None:
@@ -724,6 +726,8 @@ def _run_validation(items: int) -> None:
             ),
             flush=True,
         )
+    runtime.barrier()
+    runtime.close()
 
 
 def main() -> None:

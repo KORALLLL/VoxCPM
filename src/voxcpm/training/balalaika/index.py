@@ -184,7 +184,8 @@ def _create_schema(database: sqlite3.Connection) -> None:
         CREATE TABLE combined_stage (
             source_relative_path TEXT PRIMARY KEY,
             sidecar_offset INTEGER NOT NULL CHECK (sidecar_offset >= 0),
-            sidecar_size INTEGER NOT NULL CHECK (sidecar_size > 0)
+            sidecar_size INTEGER NOT NULL CHECK (sidecar_size > 0),
+            has_text INTEGER NOT NULL CHECK (has_text IN (0, 1))
         ) WITHOUT ROWID;
 
         CREATE TABLE samples (
@@ -282,11 +283,13 @@ def _scan_source_tar(path: Path) -> dict[str, object]:
     for stem in sorted(audio_members):
         audio_identity, audio_offset, audio_size = audio_members[stem]
         json_identity, json_offset, json_size, duration = json_members[stem]
-        if audio_identity != json_identity:
+        shard = path.stem.removeprefix("shard_")
+        expected_identity = f"{shard}/{audio_identity}"
+        if expected_identity != json_identity:
             raise IndexIntegrityError(
-                f"source JSON identity does not match audio member: {json_identity!r} != {audio_identity!r}"
+                f"source JSON identity does not match audio member: {json_identity!r} != {expected_identity!r}"
             )
-        rows.append((audio_identity, str(path.resolve()), audio_offset, audio_size, json_offset, json_size, duration))
+        rows.append((json_identity, str(path.resolve()), audio_offset, audio_size, json_offset, json_size, duration))
     return {"sha256": digest, "rows": rows}
 
 
@@ -348,7 +351,7 @@ def _scan_rover_archive(database: sqlite3.Connection, path: Path, expectations: 
 def _scan_combined_sidecar(database: sqlite3.Connection, path: Path, expectations: BuildExpectations) -> int:
     if not path.is_file():
         raise IndexIntegrityError(f"missing combined sidecar: {path}")
-    rows: list[tuple[str, int, int]] = []
+    rows: list[tuple[str, int, int, int]] = []
     count = 0
     offset = 0
     with path.open("rb") as source:
@@ -362,15 +365,16 @@ def _scan_combined_sidecar(database: sqlite3.Connection, path: Path, expectation
             payload = _load_json(line, f"combined sidecar row {line_number}")
             identity = _identity_from_row(payload, f"combined sidecar row {line_number}")
             text = payload.get("rover_punctuated_accented")
-            if not isinstance(text, str) or not text.strip():
-                raise IndexIntegrityError(f"empty combined text for identity {identity!r}")
-            rows.append((identity, offset, size))
+            rows.append((identity, offset, size, int(isinstance(text, str) and bool(text.strip()))))
             count += 1
             offset += size
             if len(rows) == _BATCH_SIZE:
                 _insert_rows(
                     database,
-                    "INSERT INTO combined_stage (source_relative_path, sidecar_offset, sidecar_size) VALUES (?, ?, ?)",
+                    """
+                    INSERT INTO combined_stage (source_relative_path, sidecar_offset, sidecar_size, has_text)
+                    VALUES (?, ?, ?, ?)
+                    """,
                     rows,
                     "combined sidecar",
                 )
@@ -378,7 +382,10 @@ def _scan_combined_sidecar(database: sqlite3.Connection, path: Path, expectation
         actual_hash = reader.digest.hexdigest()
     _insert_rows(
         database,
-        "INSERT INTO combined_stage (source_relative_path, sidecar_offset, sidecar_size) VALUES (?, ?, ?)",
+        """
+        INSERT INTO combined_stage (source_relative_path, sidecar_offset, sidecar_size, has_text)
+        VALUES (?, ?, ?, ?)
+        """,
         rows,
         "combined sidecar",
     )
@@ -455,6 +462,17 @@ def _join_staging_rows(database: sqlite3.Connection) -> None:
         LIMIT 1
         """,
         "unexpected combined identity",
+    )
+    _raise_missing_identity(
+        database,
+        """
+        SELECT combined.source_relative_path
+        FROM combined_stage AS combined
+        JOIN rover_stage AS rover USING (source_relative_path)
+        WHERE combined.has_text = 0 AND rover.agreement IS NOT NULL
+        LIMIT 1
+        """,
+        "empty combined text",
     )
     with database:
         database.execute("""

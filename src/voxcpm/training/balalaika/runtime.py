@@ -49,6 +49,8 @@ class TrainingRuntime(Protocol):
 
     def load(self, input_dir: str | PathLike[str]) -> None: ...
 
+    def close(self) -> None: ...
+
 
 class AccelerateRuntime:
     """Small Accelerate facade that keeps trainer code on supported public APIs."""
@@ -145,6 +147,10 @@ class AccelerateRuntime:
 
     def load(self, input_dir: str | PathLike[str]) -> None:
         self.accelerator.load_state(str(input_dir))
+
+    def close(self) -> None:
+        """Finish Accelerate-owned resources, including the distributed process group."""
+        self.accelerator.end_training()
 
 
 def _config_accumulation(config: Any) -> int:
