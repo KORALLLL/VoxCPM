@@ -277,7 +277,7 @@ class WandbRunManager:
             job_type=job_type,
             mode=settings.mode,
             dir=str(settings.directory),
-            config=settings.wandb_config,
+            config=dict(settings.wandb_config),
         )
         if run is None:
             run = getattr(module, "run", None)

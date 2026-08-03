@@ -211,3 +211,11 @@
 - Validation: The three regressions first failed for the exact old behaviors, then passed together. The final post-format suite passed 373 tests with 18 expected TorchCodec warnings in 103.84 seconds; changed-file Black, Flake8, compileall, and diff checks passed.
 - Validation: Read-only production audit reproduced 519 shards, 4,075,032 joined rows, 4,074,723 eligible rows, 309 exclusions, the 2,486,821/1,587,902 stage split, and unchanged index/selection/audit fingerprints. Fresh one-rank and eight-rank checkpoint smokes plus eight-rank/32-item validation passed.
 - Scope: Protected corpus artifact sizes and nanosecond mtimes were identical before and after. No real pin/prepare, memorization, approval, stage training, W&B/model publication, or proprietary-corpus write was performed.
+
+## 2026-08-03 - W&B memorization start compatibility
+
+- Failure: The first real memorization launch authenticated successfully and durably created its run state, then all ranks stopped before any optimizer update because rank zero received `TypeError: config must be a dict or have a __dict__ attribute` from `wandb.init`.
+- Root cause: `_RunSettings` correctly retained an immutable `MappingProxyType` snapshot internally, but `WandbRunManager.start` forwarded that proxy through the external SDK boundary even though W&B 0.28.1 declares and enforces a plain-dict configuration contract.
+- Fix: Preserve the immutable internal snapshot and create a shallow plain `dict` only for the `wandb.init(config=...)` call boundary.
+- Retry: A strict SDK-contract regression injects an init failure after config validation and proves the subsequent start reuses the already-persisted run ID with `resume="allow"`. The real `/workspace/balalaika_lora_training/memorization/wandb-run.json` was not read, modified, or deleted, so the next operator launch retains its durable identity.
+- Validation: The regression failed with the exact production `MappingProxyType` error before the fix and passed afterward. Post-format tracking/memorization coverage passed 57 tests, the full suite passed 374 tests with 18 expected warnings, and changed-file Black, Flake8, compileall, and diff checks passed. No real W&B initialization, memorization, or training was run.

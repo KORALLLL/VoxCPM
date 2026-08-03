@@ -219,6 +219,40 @@ def test_run_id_is_persisted_before_wandb_init_and_resumed(tmp_path: Path) -> No
     assert all(call["job_type"] == "stage1" for call in fake_wandb.init_calls)
 
 
+def test_wandb_init_receives_plain_config_and_reuses_persisted_id_after_failed_start(tmp_path: Path) -> None:
+    """Catches immutable internal config crossing the SDK boundary or retrying with a new run identity."""
+
+    class StrictWandb(FakeWandb):
+        def __init__(self, directory: Path):
+            super().__init__(directory)
+            self.attempts: list[dict[str, object]] = []
+            self.failures_remaining = 1
+
+        def init(self, **kwargs: object) -> FakeRun:
+            config = kwargs.get("config")
+            if not isinstance(config, dict) and not hasattr(config, "__dict__"):
+                raise TypeError("config must be a dict or have a __dict__ attribute")
+            self.attempts.append(kwargs)
+            if self.failures_remaining:
+                self.failures_remaining -= 1
+                raise RuntimeError("injected W&B init transport failure")
+            return super().init(**kwargs)
+
+    state_path = tmp_path / "state" / "memorization.json"
+    strict_wandb = StrictWandb(tmp_path / "wandb-run")
+
+    with pytest.raises(RuntimeError, match="init transport failure"):
+        WandbRunManager.start("memorization", state_path, wandb_config(tmp_path), wandb_module=strict_wandb)
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+
+    manager = WandbRunManager.start("memorization", state_path, wandb_config(tmp_path), wandb_module=strict_wandb)
+
+    assert manager.run_id == persisted["run_id"]
+    assert [attempt["id"] for attempt in strict_wandb.attempts] == [persisted["run_id"], persisted["run_id"]]
+    assert all(attempt["resume"] == "allow" for attempt in strict_wandb.attempts)
+    assert all(type(attempt["config"]) is dict for attempt in strict_wandb.attempts)
+
+
 def test_run_state_rejects_a_changed_config_before_wandb_init(tmp_path: Path) -> None:
     """Catches a resumed run silently mixing a new training configuration into its old W&B identity."""
     state_path = tmp_path / "state.json"
@@ -364,7 +398,7 @@ def test_validation_persists_and_validates_full_snapshot_before_wandb_log(tmp_pa
 
 
 def test_snapshot_log_and_completion_failures_preserve_safe_retry_order(tmp_path: Path, monkeypatch) -> None:
-    """Catches snapshot, log, or completion failures reporting a boundary complete without a verified recovery record."""
+    """Catches failures reporting a boundary complete without a verified recovery record."""
     payload = validation_payload(tmp_path)
     snapshot_path = payload.artifact_dir / "wandb-boundaries" / "stage1-step-000000010.snapshot.json"
     manifest_path = payload.artifact_dir / "wandb-boundaries" / "stage1-step-000000010.json"
