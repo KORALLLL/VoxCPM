@@ -21,6 +21,8 @@ class DataConfig(_ConfigModel):
     expected_shards: int = Field(default=519, gt=0)
     expected_rows: int = Field(default=4_075_032, gt=0)
     expected_null_agreement: int = Field(default=309, ge=0)
+    expected_stage1_rows: int = Field(default=2_486_821, ge=0)
+    expected_stage2_rows: int = Field(default=1_587_902, ge=0)
 
 
 class HubConfig(_ConfigModel):

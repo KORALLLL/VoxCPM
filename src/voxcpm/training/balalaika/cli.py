@@ -112,6 +112,10 @@ def _dispatch(
     if command == "prepare":
         return commands.prepare(config)
     if command == "memorize":
+        if args.smoke:
+            raise CliSafetyError(
+                "memorize --smoke is synthetic-only; run scripts/smoke_balalaika_accelerate.py directly"
+            )
         _require_world_size(environ, smoke=args.smoke)
         return commands.memorize(config, smoke=args.smoke)
     if command == "approve":

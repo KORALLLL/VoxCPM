@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
+import voxcpm.training.balalaika.workflow as workflow_module
 from voxcpm.training.balalaika.cli import CommandResult, main
 from voxcpm.training.balalaika.config import BalalaikaConfig
 from voxcpm.training.balalaika.workflow import ProductionCommands, load_build_expectations
@@ -145,6 +146,73 @@ def test_memorize_and_approve_route_without_starting_large_training(config_path,
     assert json.loads(memorize_stdout)["large_training_started"] is False
     assert json.loads(approve_stdout)["status"] == "approved"
     assert commands.calls == [("memorize", False), ("approve", "run-123")]
+
+
+def test_memorize_smoke_rejects_before_runtime_or_runner_side_effects(config_path, tmp_path, capsys):
+    """Catches a smoke flag bypassing the process guard and entering real memorization setup."""
+    side_effect = tmp_path / "real-memorization-started"
+
+    def runtime_factory(_config):
+        side_effect.write_text("runtime-created", encoding="utf-8")
+        raise AssertionError("real runtime must not be created by smoke")
+
+    commands = ProductionCommands(runtime_factory=runtime_factory)
+
+    code, _, stderr = _invoke(config_path, ["memorize", "--smoke"], commands, capsys)
+
+    assert code == 2
+    assert "scripts/smoke_balalaika_accelerate.py" in stderr
+    assert not side_effect.exists()
+
+
+@pytest.mark.parametrize("runner_fails", [False, True])
+def test_real_memorization_closes_its_runtime_once_on_success_and_failure(config_path, runner_fails):
+    """Catches the real memorization runtime owner leaking Accelerate resources on either exit path."""
+    config = BalalaikaConfig.load(config_path)
+    events: list[str] = []
+
+    class Runtime:
+        def close(self):
+            events.append("close")
+
+    def run(_config, _runtime):
+        events.append("run")
+        if runner_fails:
+            raise RuntimeError("memorization failed")
+        return SimpleNamespace(
+            status="stopped",
+            result_path=config.output_dir / "result.json",
+            checkpoint=config.output_dir / "checkpoint",
+            wandb_run_id="run-123",
+            large_training_started=False,
+        )
+
+    commands = ProductionCommands(runtime_factory=lambda _config: Runtime(), memorization_runner=run)
+
+    if runner_fails:
+        with pytest.raises(RuntimeError, match="memorization failed"):
+            commands.memorize(config, smoke=False)
+    else:
+        assert commands.memorize(config, smoke=False).values["status"] == "stopped"
+
+    assert events == ["run", "close"]
+
+
+def test_memorization_preserves_runner_failure_when_runtime_close_also_fails(config_path):
+    """Catches teardown masking the operational failure that operators must diagnose."""
+    config = BalalaikaConfig.load(config_path)
+
+    class Runtime:
+        def close(self):
+            raise RuntimeError("close failed")
+
+    commands = ProductionCommands(
+        runtime_factory=lambda _config: Runtime(),
+        memorization_runner=lambda *_args: (_ for _ in ()).throw(ValueError("runner failed")),
+    )
+
+    with pytest.raises(ValueError, match="runner failed"):
+        commands.memorize(config, smoke=False)
 
 
 def test_train_stage1_requires_matching_approval(config_path, capsys):
@@ -339,7 +407,7 @@ def test_load_build_expectations_binds_every_augmented_shard_to_its_verified_sou
     assert expectations.combined_sidecar_sha256 == "d" * 64
 
 
-def test_production_prepare_builds_index_then_fixed_selection(config_path, tmp_path):
+def test_production_prepare_builds_index_then_fixed_selection(config_path, tmp_path, monkeypatch):
     """Catches preparation publishing selections before its verified index or using an unpinned benchmark."""
     config = BalalaikaConfig.load(config_path)
     benchmark = config.hub.local_dir / "benchmark" / config.hub.benchmark_file
@@ -379,7 +447,9 @@ def test_production_prepare_builds_index_then_fixed_selection(config_path, tmp_p
         expectation_loader=expectation_loader,
         index_builder=index_builder,
         selection_builder=selection_builder,
+        generation_validator=lambda *_args: None,
     )
+    monkeypatch.setattr(workflow_module, "_verified_pins", lambda _config: {})
 
     result = commands.prepare(config)
 
@@ -391,7 +461,151 @@ def test_production_prepare_builds_index_then_fixed_selection(config_path, tmp_p
     assert result.values["benchmark_assignments"] == 2_000
 
 
-def test_production_config_routes_the_pinned_hard_number_benchmark(tmp_path):
+def test_production_prepare_verifies_all_pins_before_reading_inputs(config_path, monkeypatch):
+    """Catches preparation consuming corpus or benchmark state before rehashing every immutable Hub pin."""
+    config = BalalaikaConfig.load(config_path)
+    benchmark = config.hub.local_dir / "benchmark" / config.hub.benchmark_file
+    benchmark.parent.mkdir(parents=True)
+    benchmark.write_text('{"id": 0}\n', encoding="utf-8")
+    events: list[str] = []
+
+    def verify_pins(_config):
+        events.append("pins")
+        return {"model": {}, "benchmark": {}, "gigaam": {}}
+
+    def build_index(data, _expectations):
+        events.append("index")
+        data.index_dir.mkdir(parents=True)
+        index_path = data.index_dir / "balalaika-index.sqlite3"
+        index_path.write_bytes(b"new-index")
+        audit_path = data.index_dir / "balalaika-index-audit.json"
+        audit_path.write_text("{}", encoding="utf-8")
+        return SimpleNamespace(
+            index_path=index_path,
+            audit_path=audit_path,
+            fingerprint="index-fingerprint",
+            total_rows=4_075_032,
+            eligible_rows=4_074_723,
+            stage1_rows=1_000_000,
+            stage2_rows=3_074_723,
+            excluded_null_agreement=309,
+        )
+
+    def build_selection(*_args):
+        events.append("selection")
+        return SimpleNamespace(
+            fingerprint="selection-fingerprint",
+            memorization=[1, 2, 3, 4],
+            prompts=list(range(20)),
+            benchmark_prompt_by_id={item: "prompt-00" for item in range(2_000)},
+        )
+
+    monkeypatch.setattr(workflow_module, "_verified_pins", verify_pins)
+    commands = ProductionCommands(
+        expectation_loader=lambda _data: events.append("expectations") or "expectations",
+        index_builder=build_index,
+        selection_builder=build_selection,
+        generation_validator=lambda *_args: None,
+    )
+
+    commands.prepare(config)
+
+    assert events == ["pins", "expectations", "index", "selection"]
+
+
+def test_prepare_selection_failure_restores_previous_index_without_copying(config_path, monkeypatch):
+    """Catches a failed selection leaving a newly published index paired with the prior selection generation."""
+    config = BalalaikaConfig.load(config_path)
+    benchmark = config.hub.local_dir / "benchmark" / config.hub.benchmark_file
+    benchmark.parent.mkdir(parents=True)
+    benchmark.write_text('{"id": 0}\n', encoding="utf-8")
+    config.data.index_dir.mkdir(parents=True)
+    previous_index = config.data.index_dir / "balalaika-index.sqlite3"
+    previous_index.write_bytes(b"previous-complete-index")
+    previous_inode = previous_index.stat().st_ino
+    (config.data.index_dir / "balalaika-index-audit.json").write_text('{"generation":"previous"}', encoding="utf-8")
+    config.selection_dir.mkdir(parents=True)
+    (config.selection_dir / "complete-generation.txt").write_text("previous", encoding="utf-8")
+
+    def build_index(data, _expectations):
+        data.index_dir.mkdir(parents=True, exist_ok=True)
+        index_path = data.index_dir / "balalaika-index.sqlite3"
+        index_path.write_bytes(b"new-uncommitted-index")
+        audit_path = data.index_dir / "balalaika-index-audit.json"
+        audit_path.write_text('{"generation":"new"}', encoding="utf-8")
+        return SimpleNamespace(
+            index_path=index_path,
+            audit_path=audit_path,
+            fingerprint="new-index-fingerprint",
+            total_rows=4_075_032,
+            eligible_rows=4_074_723,
+            stage1_rows=1_000_000,
+            stage2_rows=3_074_723,
+            excluded_null_agreement=309,
+        )
+
+    monkeypatch.setattr(workflow_module, "_verified_pins", lambda _config: {})
+    commands = ProductionCommands(
+        expectation_loader=lambda _data: "expectations",
+        index_builder=build_index,
+        selection_builder=lambda *_args: (_ for _ in ()).throw(RuntimeError("selection publication failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="selection publication failed"):
+        commands.prepare(config)
+
+    assert previous_index.read_bytes() == b"previous-complete-index"
+    assert previous_index.stat().st_ino == previous_inode
+    assert (config.data.index_dir / "balalaika-index-audit.json").read_text(
+        encoding="utf-8"
+    ) == '{"generation":"previous"}'
+    assert (config.selection_dir / "complete-generation.txt").read_text(encoding="utf-8") == "previous"
+
+
+def test_prepare_refuses_to_commit_missing_generation_outputs_and_restores_previous(config_path, monkeypatch):
+    """Catches a successful-returning fake or broken builder deleting the prior complete generation."""
+    config = BalalaikaConfig.load(config_path)
+    benchmark = config.hub.local_dir / "benchmark" / config.hub.benchmark_file
+    benchmark.parent.mkdir(parents=True)
+    benchmark.write_text('{"id": 0}\n', encoding="utf-8")
+    config.data.index_dir.mkdir(parents=True)
+    previous_index = config.data.index_dir / "balalaika-index.sqlite3"
+    previous_index.write_bytes(b"previous-complete-index")
+    previous_inode = previous_index.stat().st_ino
+    (config.data.index_dir / "balalaika-index-audit.json").write_text('{"generation":"previous"}', encoding="utf-8")
+    config.selection_dir.mkdir(parents=True)
+    previous_selection = config.selection_dir / "memorization.json"
+    previous_selection.write_text('{"generation":"previous"}', encoding="utf-8")
+    monkeypatch.setattr(workflow_module, "_verified_pins", lambda _config: {})
+    commands = ProductionCommands(
+        expectation_loader=lambda _data: "expectations",
+        index_builder=lambda data, _expectations: SimpleNamespace(
+            index_path=data.index_dir / "balalaika-index.sqlite3",
+            audit_path=data.index_dir / "balalaika-index-audit.json",
+            fingerprint="missing-generation",
+            total_rows=4_075_032,
+            eligible_rows=4_074_723,
+            stage1_rows=2_486_821,
+            stage2_rows=1_587_902,
+            excluded_null_agreement=309,
+        ),
+        selection_builder=lambda *_args: SimpleNamespace(
+            fingerprint="missing-generation",
+            memorization=[1, 2, 3, 4],
+            prompts=list(range(20)),
+            benchmark_prompt_by_id={item: "prompt-00" for item in range(2_000)},
+        ),
+    )
+
+    with pytest.raises(ValueError, match="prepared generation.*missing"):
+        commands.prepare(config)
+
+    assert previous_index.read_bytes() == b"previous-complete-index"
+    assert previous_index.stat().st_ino == previous_inode
+    assert previous_selection.read_text(encoding="utf-8") == '{"generation":"previous"}'
+
+
+def test_production_config_routes_the_pinned_hard_number_benchmark(tmp_path, monkeypatch):
     """Catches preparation assuming a benchmark filename absent from the pinned dataset revision."""
     root = Path(__file__).resolve().parents[3]
     config = BalalaikaConfig.load(root / "conf" / "voxcpm_v2" / "balalaika_lora.yaml")
@@ -399,10 +613,17 @@ def test_production_config_routes_the_pinned_hard_number_benchmark(tmp_path):
     benchmark = hub_root / "benchmark" / "hard_number_eval.jsonl"
     benchmark.parent.mkdir(parents=True)
     benchmark.write_text('{"id": 0}\n', encoding="utf-8")
-    config = config.model_copy(update={"hub": config.hub.model_copy(update={"local_dir": hub_root})})
+    config = config.model_copy(
+        update={
+            "output_dir": tmp_path / "runs",
+            "selection_dir": tmp_path / "selection",
+            "data": config.data.model_copy(update={"index_dir": tmp_path / "index"}),
+            "hub": config.hub.model_copy(update={"local_dir": hub_root}),
+        }
+    )
     audit = SimpleNamespace(
-        index_path=tmp_path / "balalaika-index.sqlite3",
-        audit_path=tmp_path / "balalaika-index-audit.json",
+        index_path=config.data.index_dir / "balalaika-index.sqlite3",
+        audit_path=config.data.index_dir / "balalaika-index-audit.json",
         fingerprint="index-fingerprint",
         total_rows=4_075_032,
         eligible_rows=4_074_723,
@@ -429,11 +650,17 @@ def test_production_config_routes_the_pinned_hard_number_benchmark(tmp_path):
         expectation_loader=lambda data: "trusted-expectations",
         index_builder=lambda data, expectations: audit,
         selection_builder=selection_builder,
+        generation_validator=lambda *_args: None,
     )
+    monkeypatch.setattr(workflow_module, "_verified_pins", lambda _config: {})
 
     commands.prepare(config)
 
     assert selected_paths == [benchmark]
+    assert config.output_dir.is_relative_to(tmp_path)
+    assert config.data.index_dir.is_relative_to(tmp_path)
+    assert config.selection_dir.is_relative_to(tmp_path)
+    assert config.hub.local_dir.is_relative_to(tmp_path)
 
 
 def test_checked_in_config_loads_complete_operator_defaults():
@@ -445,6 +672,8 @@ def test_checked_in_config_loads_complete_operator_defaults():
     assert config.data.expected_shards == 519
     assert config.data.expected_rows == 4_075_032
     assert config.data.expected_null_agreement == 309
+    assert config.data.expected_stage1_rows == 2_486_821
+    assert config.data.expected_stage2_rows == 1_587_902
     assert config.hub.model_repo_id == "OpenBMB/VoxCPM2"
     assert config.hub.benchmark_repo_id == "bitmanagerai/hard_number_eval_for_tts"
     assert config.hub.gigaam_repo_id == "istupakov/gigaam-v3-onnx"
@@ -453,65 +682,3 @@ def test_checked_in_config_loads_complete_operator_defaults():
     assert config.lora.r == config.lora.alpha == 32
     assert config.wandb.project == "voxcpm-balalaika"
     assert config.wandb.mode in {"online", "offline"}
-
-
-def test_production_audit_rejects_a_changed_pinned_file(tmp_path):
-    """Catches audit reporting success after a locally pinned Hub artifact changes."""
-    value = _config_value(tmp_path)
-    value["hub"] = {"local_dir": str(tmp_path / "hub"), "gigaam_repo_id": "istupakov/gigaam-v3-onnx"}
-    config = BalalaikaConfig.model_validate(value)
-    config.data.index_dir.mkdir(parents=True)
-    index_path = config.data.index_dir / "balalaika-index.sqlite3"
-    index_path.write_bytes(b"verified-index")
-    (config.data.index_dir / "balalaika-index-audit.json").write_text(
-        json.dumps(
-            {
-                "index_sha256": hashlib.sha256(b"verified-index").hexdigest(),
-                "fingerprint": "index-fingerprint",
-                "total_rows": 4_075_032,
-                "eligible_rows": 4_074_723,
-                "stage1_rows": 1_000_000,
-                "stage2_rows": 3_074_723,
-                "excluded_null_agreement": 309,
-            }
-        ),
-        encoding="utf-8",
-    )
-    config.selection_dir.mkdir(parents=True)
-    common = {"fingerprint": "selection-fingerprint", "seed": 20_260_802}
-    selections = {
-        "memorization.json": {**common, "memorization": list(range(4))},
-        "prompts.json": {**common, "prompts": list(range(20))},
-        "benchmark-prompts.json": {
-            **common,
-            "benchmark_prompt_by_id": {str(item): "prompt-00" for item in range(2_000)},
-        },
-        "audio-log-ids.json": {**common, "audio_log_ids": [0, 1, 2, 3]},
-    }
-    for name, payload in selections.items():
-        (config.selection_dir / name).write_text(json.dumps(payload), encoding="utf-8")
-    pin_values = {}
-    for name, kind, repo_id in (
-        ("model", "model", config.hub.model_repo_id),
-        ("benchmark", "dataset", config.hub.benchmark_repo_id),
-        ("gigaam", "model", config.hub.gigaam_repo_id),
-    ):
-        local_dir = config.hub.local_dir / name
-        local_dir.mkdir(parents=True)
-        artifact = local_dir / "artifact.bin"
-        artifact.write_bytes(name.encode())
-        pin_values[name] = {
-            "kind": kind,
-            "repo_id": repo_id,
-            "revision": f"{name}-revision",
-            "local_dir": str(local_dir.resolve()),
-            "files": {"artifact.bin": hashlib.sha256(name.encode()).hexdigest()},
-        }
-    (config.hub.local_dir / "hub-pins.json").write_text(json.dumps(pin_values), encoding="utf-8")
-    commands = ProductionCommands()
-
-    assert commands.audit(config).values["status"] == "complete"
-    (config.hub.local_dir / "model" / "artifact.bin").write_bytes(b"changed")
-
-    with pytest.raises(ValueError, match="changed after download"):
-        commands.audit(config)

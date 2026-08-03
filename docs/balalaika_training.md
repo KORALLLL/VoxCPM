@@ -17,12 +17,13 @@ Run commands from the VoxCPM repository root:
 
 ```bash
 rtk uv sync --extra dev --extra balalaika
-hf auth whoami
-wandb login
+rtk uv run hf auth whoami
+rtk uv run wandb login
 ```
 
-If `hf auth whoami` is not the account authorized for the private
-`bitmanagerai/hard_number_eval_for_tts` dataset, use `hf auth login` and retry.
+If `rtk uv run hf auth whoami` is not the account authorized for the private
+`bitmanagerai/hard_number_eval_for_tts` dataset, use `rtk uv run hf auth login`
+and retry.
 The `pin` command invokes only the modern `hf` CLI through the pipeline's Hub
 module: it resolves immutable revisions with `hf models info` / `hf datasets
 info` and downloads them with `hf download`. Tokens remain in the operator's

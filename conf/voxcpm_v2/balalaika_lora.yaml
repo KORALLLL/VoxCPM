@@ -6,6 +6,8 @@ data:
   expected_shards: 519
   expected_rows: 4075032
   expected_null_agreement: 309
+  expected_stage1_rows: 2486821
+  expected_stage2_rows: 1587902
 
 output_dir: /workspace/balalaika_lora_training/runs
 selection_dir: /workspace/balalaika_lora_training/selection

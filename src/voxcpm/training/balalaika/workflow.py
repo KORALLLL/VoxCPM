@@ -4,12 +4,15 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+import fcntl
 import json
 import os
 from pathlib import Path
+import shutil
 import sqlite3
 import subprocess
 from subprocess import CompletedProcess
+from tempfile import mkdtemp
 from typing import Any
 
 from .artifacts import sha256_file
@@ -123,6 +126,7 @@ class ProductionCommands:
     expectation_loader: Callable[[DataConfig], BuildExpectations] = load_build_expectations
     index_builder: Callable[[DataConfig, BuildExpectations], IndexAudit] = build_index
     selection_builder: Callable[[str | Path, str | Path, str | Path, int], SelectionBundle] = create_selection_manifests
+    generation_validator: Callable[[BalalaikaConfig, IndexAudit, SelectionBundle], None] | None = None
     runtime_factory: Callable[[Any], Any] = AccelerateRuntime.create
     memorization_runner: Callable[[Any, Any], Any] = run_memorization
     approval_writer: Callable[[str | Path, str, str], Path] = approve_memorization
@@ -140,15 +144,20 @@ class ProductionCommands:
         )
 
     def prepare(self, config: BalalaikaConfig) -> CommandResult:
+        _verified_pins(config)
         expectations = self.expectation_loader(config.data)
-        audit = self.index_builder(config.data, expectations)
         benchmark_path = config.hub.local_dir / "benchmark" / config.hub.benchmark_file
-        selection = self.selection_builder(
-            audit.index_path,
-            benchmark_path,
-            config.selection_dir,
-            config.runtime.seed,
-        )
+        with _PreparationTransaction(config) as transaction:
+            audit = self.index_builder(config.data, expectations)
+            selection = self.selection_builder(
+                audit.index_path,
+                benchmark_path,
+                config.selection_dir,
+                config.runtime.seed,
+            )
+            validator = self.generation_validator or _validate_prepared_generation
+            validator(config, audit, selection)
+            transaction.commit()
         return CommandResult(
             "prepare",
             {
@@ -171,17 +180,24 @@ class ProductionCommands:
     def memorize(self, config: BalalaikaConfig, *, smoke: bool) -> CommandResult:
         del smoke
         runtime = self.runtime_factory(config.memorization)
-        result = self.memorization_runner(config, runtime)
-        return CommandResult(
-            "memorize",
-            {
-                "status": result.status,
-                "result_path": result.result_path,
-                "checkpoint": result.checkpoint,
-                "wandb_run_id": result.wandb_run_id,
-                "large_training_started": result.large_training_started,
-            },
-        )
+        failure: BaseException | None = None
+        try:
+            result = self.memorization_runner(config, runtime)
+            return CommandResult(
+                "memorize",
+                {
+                    "status": result.status,
+                    "result_path": result.result_path,
+                    "checkpoint": result.checkpoint,
+                    "wandb_run_id": result.wandb_run_id,
+                    "large_training_started": result.large_training_started,
+                },
+            )
+        except BaseException as error:
+            failure = error
+            raise
+        finally:
+            _close_runtime(runtime, failure)
 
     def approve(self, config: BalalaikaConfig, *, wandb_run_id: str) -> CommandResult:
         approver = os.environ.get("USER") or os.environ.get("LOGNAME")
@@ -216,33 +232,111 @@ class ProductionCommands:
     def audit(self, config: BalalaikaConfig) -> CommandResult:
         audit_path = config.data.index_dir / "balalaika-index-audit.json"
         index_path = config.data.index_dir / "balalaika-index.sqlite3"
-        audit = _read_json(audit_path, "index audit")
-        if not index_path.is_file() or audit.get("index_sha256") != sha256_file(index_path):
-            raise ValueError("prepared index is absent or does not match its audit hash")
-        expected = {
-            "total_rows": config.data.expected_rows,
-            "excluded_null_agreement": config.data.expected_null_agreement,
-        }
-        for name, value in expected.items():
-            if audit.get(name) != value:
-                raise ValueError(f"production audit {name} mismatch: expected {value}, found {audit.get(name)}")
-        selections = _load_selection_summary(config.selection_dir)
         _verified_pins(config)
+        expectations = self.expectation_loader(config.data)
+        index_values = _deep_audit_index(config, index_path, audit_path, expectations)
+        selections = _deep_audit_selection(config, index_path, index_values["fingerprint"])
         return CommandResult(
             "audit",
             {
                 "status": "complete",
                 "source_shards": config.data.expected_shards,
-                "joined_rows": audit["total_rows"],
-                "eligible_rows": audit["eligible_rows"],
-                "stage1_rows": audit["stage1_rows"],
-                "stage2_rows": audit["stage2_rows"],
-                "excluded_null_agreement": audit["excluded_null_agreement"],
+                "joined_rows": index_values["total_rows"],
+                "eligible_rows": index_values["eligible_rows"],
+                "stage1_rows": index_values["stage1_rows"],
+                "stage2_rows": index_values["stage2_rows"],
+                "excluded_null_agreement": index_values["excluded_null_agreement"],
                 "index_bytes": index_path.stat().st_size,
-                "fingerprint": audit["fingerprint"],
+                "fingerprint": index_values["fingerprint"],
+                "audit_identity": index_values["audit_identity"],
                 **selections,
             },
         )
+
+
+class _PreparationTransaction:
+    """Publish index and selection as one rollback-capable filesystem generation."""
+
+    def __init__(self, config: BalalaikaConfig):
+        self._roots = (config.data.index_dir.resolve(), config.selection_dir.resolve())
+        if self._roots[0] == self._roots[1]:
+            raise ValueError("index_dir and selection_dir must be distinct generation roots")
+        self._lock_path = config.output_dir.resolve() / ".prepare.lock"
+        self._lock_descriptor: int | None = None
+        self._backups: dict[Path, Path] = {}
+        self._committed = False
+
+    def __enter__(self) -> "_PreparationTransaction":
+        self._lock_path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock_descriptor = os.open(self._lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(self._lock_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            os.close(self._lock_descriptor)
+            self._lock_descriptor = None
+            raise RuntimeError("another Balalaika preparation is already active") from error
+        try:
+            for root in self._roots:
+                root.parent.mkdir(parents=True, exist_ok=True)
+                if root.exists():
+                    backup = Path(mkdtemp(prefix=f".{root.name}.previous-", dir=root.parent))
+                    backup.rmdir()
+                    os.replace(root, backup)
+                    self._backups[root] = backup
+        except BaseException:
+            self._restore_previous()
+            self._unlock()
+            raise
+        return self
+
+    def commit(self) -> None:
+        self._committed = True
+
+    def __exit__(self, _type: object, _value: object, _traceback: object) -> None:
+        try:
+            if self._committed and _type is None:
+                for backup in self._backups.values():
+                    shutil.rmtree(backup)
+            else:
+                self._restore_previous()
+        finally:
+            self._unlock()
+
+    def _restore_previous(self) -> None:
+        for root in reversed(self._roots):
+            if root.exists():
+                shutil.rmtree(root)
+            backup = self._backups.get(root)
+            if backup is not None and backup.exists():
+                os.replace(backup, root)
+
+    def _unlock(self) -> None:
+        if self._lock_descriptor is not None:
+            fcntl.flock(self._lock_descriptor, fcntl.LOCK_UN)
+            os.close(self._lock_descriptor)
+            self._lock_descriptor = None
+
+
+def _validate_prepared_generation(
+    config: BalalaikaConfig,
+    audit: IndexAudit,
+    selection: SelectionBundle,
+) -> None:
+    index_path = config.data.index_dir / "balalaika-index.sqlite3"
+    audit_path = config.data.index_dir / "balalaika-index-audit.json"
+    if audit.index_path.resolve() != index_path.resolve() or not index_path.is_file():
+        raise ValueError("prepared generation index is missing or published at the wrong path")
+    if audit.audit_path.resolve() != audit_path.resolve() or not audit_path.is_file():
+        raise ValueError("prepared generation index audit is missing or published at the wrong path")
+    declared_audit = _read_json(audit_path, "prepared generation index audit")
+    if declared_audit.get("index_sha256") != sha256_file(index_path):
+        raise ValueError("prepared generation index hash does not match its audit")
+    index_fingerprint = _index_fingerprint(config)
+    if declared_audit.get("fingerprint") != index_fingerprint or audit.fingerprint != index_fingerprint:
+        raise ValueError("prepared generation index identity is inconsistent")
+    selection_summary = _deep_audit_selection(config, index_path, index_fingerprint)
+    if selection_summary["selection_fingerprint"] != selection.fingerprint:
+        raise ValueError("prepared generation selection identity is inconsistent")
 
 
 def _run_configured_training(
@@ -274,6 +368,42 @@ def _run_configured_training(
         verify_approval(approval_path, approval_expected)
 
     runtime = AccelerateRuntime.create(config.runtime)
+    failure: BaseException | None = None
+    try:
+        return _run_training_with_runtime(
+            config,
+            stage=stage,
+            resume=resume,
+            stage1_checkpoint=stage1_checkpoint,
+            pins=pins,
+            data_fingerprint=data_fingerprint,
+            selection=selection,
+            lora_fingerprint=lora_fingerprint,
+            approval_path=approval_path,
+            approval_expected=approval_expected,
+            runtime=runtime,
+        )
+    except BaseException as error:
+        failure = error
+        raise
+    finally:
+        _close_runtime(runtime, failure)
+
+
+def _run_training_with_runtime(
+    config: BalalaikaConfig,
+    *,
+    stage: int,
+    resume: Path | None,
+    stage1_checkpoint: Path | None,
+    pins: Mapping[str, Mapping[str, Any]],
+    data_fingerprint: str,
+    selection: SelectionBundle,
+    lora_fingerprint: str,
+    approval_path: Path | None,
+    approval_expected: Mapping[str, Any] | None,
+    runtime: Any,
+) -> Path:
     stage_name = f"stage{stage}"
     stage_root = config.output_dir / stage_name
     run_state_path = stage_root / "wandb-run.json"
@@ -355,10 +485,30 @@ def _run_configured_training(
         resume_checkpoint=resume,
         stage1_checkpoint=stage1_checkpoint,
     )
+    failure: BaseException | None = None
     try:
         return trainer.run_stage(stage)
+    except BaseException as error:
+        failure = error
+        raise
     finally:
+        _finish_run_manager(run_manager, failure)
+
+
+def _finish_run_manager(run_manager: Any, active_failure: BaseException | None) -> None:
+    try:
         run_manager.finish()
+    except BaseException:
+        if active_failure is None:
+            raise
+
+
+def _close_runtime(runtime: Any, active_failure: BaseException | None) -> None:
+    try:
+        runtime.close()
+    except BaseException:
+        if active_failure is None:
+            raise
 
 
 def _run_configured_validation(
@@ -418,6 +568,303 @@ def _verified_pins(config: BalalaikaConfig) -> dict[str, dict[str, Any]]:
             raise ValueError(f"{name} pinned files changed after download")
         result[name] = dict(pin)
     return result
+
+
+def _deep_audit_index(
+    config: BalalaikaConfig,
+    index_path: Path,
+    audit_path: Path,
+    expectations: BuildExpectations,
+) -> dict[str, Any]:
+    if not index_path.is_file():
+        raise ValueError(f"prepared index is absent: {index_path}")
+    audit = _read_json(audit_path, "index audit")
+    corpus_root = config.data.corpus_root.resolve()
+    source_tars = sorted(corpus_root.glob("train/shard_*.tar"))
+    actual_source_identities = {path.relative_to(corpus_root).as_posix() for path in source_tars}
+    if actual_source_identities != set(expectations.source_tar_sha256):
+        raise ValueError("current source tar inventory does not match immutable expectations")
+    for path in source_tars:
+        relative = path.relative_to(corpus_root).as_posix()
+        if sha256_file(path) != expectations.source_tar_sha256[relative]:
+            raise ValueError(f"source tar SHA-256 mismatch: {relative}")
+
+    try:
+        with sqlite3.connect(index_path.as_uri() + "?mode=ro", uri=True) as database:
+            database.row_factory = sqlite3.Row
+            database.execute("PRAGMA query_only=ON")
+            integrity = database.execute("PRAGMA integrity_check").fetchall()
+            if [tuple(row) for row in integrity] != [("ok",)]:
+                raise ValueError(f"SQLite integrity_check failed: {[tuple(row) for row in integrity]}")
+            metadata = {row["key"]: row["value"] for row in database.execute("SELECT key, value FROM metadata")}
+            try:
+                provenance = _mapping(json.loads(metadata["provenance"]), "index provenance")
+            except (KeyError, json.JSONDecodeError) as error:
+                raise ValueError("prepared index has malformed provenance metadata") from error
+            stored_fingerprint = metadata.get("fingerprint")
+            recomputed_fingerprint = fingerprint(provenance)
+            if stored_fingerprint != recomputed_fingerprint:
+                raise ValueError("prepared index fingerprint does not match canonical provenance")
+            counts = database.execute("""
+                SELECT
+                    COUNT(*) AS total_rows,
+                    SUM(CASE WHEN stage = 1 THEN 1 ELSE 0 END) AS stage1_rows,
+                    SUM(CASE WHEN stage = 2 THEN 1 ELSE 0 END) AS stage2_rows,
+                    SUM(CASE WHEN agreement IS NULL THEN 1 ELSE 0 END) AS excluded
+                FROM samples
+                """).fetchone()
+            invalid_stage = database.execute("""
+                SELECT source_relative_path FROM samples
+                WHERE (agreement IS NULL AND stage IS NOT NULL)
+                   OR (agreement IS NOT NULL AND agreement < 0.95 AND stage IS NOT 1)
+                   OR (agreement IS NOT NULL AND agreement >= 0.95 AND stage IS NOT 2)
+                LIMIT 1
+                """).fetchone()
+            if invalid_stage is not None:
+                raise ValueError(f"prepared index stage rule mismatch: {invalid_stage[0]}")
+            ordinal_count = database.execute("SELECT COUNT(*) FROM stage_ordinals").fetchone()[0]
+            ordinal_mismatch = database.execute("""
+                SELECT ordinal.stage, ordinal.ordinal
+                FROM stage_ordinals AS ordinal
+                JOIN samples AS sample USING (sample_id)
+                WHERE ordinal.stage != sample.stage
+                LIMIT 1
+                """).fetchone()
+            ordinal_ranges = {
+                row["stage"]: (row["rows"], row["minimum"], row["maximum"]) for row in database.execute("""
+                    SELECT stage, COUNT(*) AS rows, MIN(ordinal) AS minimum, MAX(ordinal) AS maximum
+                    FROM stage_ordinals GROUP BY stage
+                    """)
+            }
+    except sqlite3.Error as error:
+        raise ValueError(f"cannot independently audit prepared index: {index_path}") from error
+
+    total_rows = int(counts["total_rows"])
+    stage1_rows = int(counts["stage1_rows"])
+    stage2_rows = int(counts["stage2_rows"])
+    excluded = int(counts["excluded"])
+    expected_counts = {
+        "total row count": (total_rows, config.data.expected_rows),
+        "stage-1 row count": (stage1_rows, config.data.expected_stage1_rows),
+        "stage-2 row count": (stage2_rows, config.data.expected_stage2_rows),
+        "null-agreement row count": (excluded, config.data.expected_null_agreement),
+    }
+    for label, (actual, expected) in expected_counts.items():
+        if actual != expected:
+            raise ValueError(f"prepared index {label} mismatch: expected {expected}, found {actual}")
+    eligible_rows = stage1_rows + stage2_rows
+    if total_rows != eligible_rows + excluded:
+        raise ValueError("prepared index eligible/null counts do not partition all rows")
+    if ordinal_count != eligible_rows or ordinal_mismatch is not None:
+        raise ValueError("prepared index stage ordinals do not bind every eligible row exactly once")
+    for stage, expected_rows in ((1, stage1_rows), (2, stage2_rows)):
+        expected_range = (expected_rows, 0, expected_rows - 1) if expected_rows else None
+        if ordinal_ranges.get(stage) != expected_range:
+            raise ValueError(f"prepared index stage-{stage} ordinals are not contiguous")
+
+    expected_provenance = {
+        "schema_version": 1,
+        "corpus_root": str(corpus_root),
+        "rover_archive": provenance.get("rover_archive"),
+        "combined_sidecar": provenance.get("combined_sidecar"),
+        "source_tars": [str(path) for path in source_tars],
+        "source_tar_sha256": dict(sorted(expectations.source_tar_sha256.items())),
+        "rover_archive_sha256": expectations.rover_archive_sha256,
+        "combined_sidecar_sha256": expectations.combined_sidecar_sha256,
+        "source_shard_count": expectations.source_shard_count,
+        "source_row_count": expectations.source_row_count,
+        "rover_row_count": expectations.rover_row_count,
+        "combined_row_count": expectations.combined_row_count,
+        "stage_rule": {"stage1": "agreement < 0.95", "stage2": "agreement >= 0.95", "excluded": "agreement is null"},
+    }
+    if dict(provenance) != expected_provenance:
+        raise ValueError("prepared index provenance does not match current immutable expectations")
+    rover_path = _corpus_provenance_path(provenance.get("rover_archive"), corpus_root, "ROVER archive")
+    combined_path = _corpus_provenance_path(provenance.get("combined_sidecar"), corpus_root, "combined sidecar")
+    if sha256_file(rover_path) != expectations.rover_archive_sha256:
+        raise ValueError("ROVER archive SHA-256 mismatch")
+    if sha256_file(combined_path) != expectations.combined_sidecar_sha256:
+        raise ValueError("combined sidecar SHA-256 mismatch")
+    if metadata.get("sidecar_path") != str(combined_path):
+        raise ValueError("prepared index sidecar path does not match canonical provenance")
+
+    index_sha256 = sha256_file(index_path)
+    recomputed_audit = {
+        "index_path": str(index_path),
+        "fingerprint": recomputed_fingerprint,
+        "index_sha256": index_sha256,
+        "total_rows": total_rows,
+        "eligible_rows": eligible_rows,
+        "stage1_rows": stage1_rows,
+        "stage2_rows": stage2_rows,
+        "excluded_null_agreement": excluded,
+    }
+    for name, expected in recomputed_audit.items():
+        if audit.get(name) != expected:
+            raise ValueError(f"index audit {name} mismatch: expected {expected}, found {audit.get(name)}")
+    return {**recomputed_audit, "audit_identity": fingerprint(recomputed_audit)}
+
+
+def _corpus_provenance_path(value: object, corpus_root: Path, label: str) -> Path:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"prepared index has no {label} path")
+    path = Path(value).resolve()
+    if not path.is_relative_to(corpus_root) or not path.is_file():
+        raise ValueError(f"prepared index {label} path is outside the immutable corpus")
+    return path
+
+
+def _deep_audit_selection(config: BalalaikaConfig, index_path: Path, index_fingerprint: str) -> dict[str, Any]:
+    root = config.selection_dir.resolve()
+    raw_manifests = {
+        "memorization": _read_json(root / "memorization.json", "memorization selection"),
+        "prompts": _read_json(root / "prompts.json", "prompt selection"),
+        "assignments": _read_json(root / "benchmark-prompts.json", "benchmark assignments"),
+        "audio_ids": _read_json(root / "audio-log-ids.json", "audio-log selection"),
+    }
+    common = {
+        (value.get("schema_version"), value.get("fingerprint"), value.get("seed")) for value in raw_manifests.values()
+    }
+    if len(common) != 1:
+        raise ValueError("selection manifests do not share one schema, fingerprint, and seed")
+    schema_version, declared_fingerprint, seed = next(iter(common))
+    if schema_version != 1 or seed != config.runtime.seed or not isinstance(declared_fingerprint, str):
+        raise ValueError("selection manifests do not match the configured schema and seed")
+    bundle = _load_selection(root)
+    if bundle.seed != config.runtime.seed or bundle.fingerprint != declared_fingerprint:
+        raise ValueError("selection bundle identity does not match its manifests")
+
+    benchmark_rows = _load_benchmark_rows(config.hub.local_dir / "benchmark" / config.hub.benchmark_file)
+    benchmark_ids = {row.id for row in benchmark_rows}
+    prompt_ids = {item.prompt_id for item in bundle.prompts}
+    expected_prompt_ids = {f"prompt-{number:02d}" for number in range(20)}
+    if len(bundle.memorization) != 4 or len({item.source_relative_path for item in bundle.memorization}) != 4:
+        raise ValueError("memorization selection must contain four unique source identities")
+    if len(bundle.prompts) != 20 or len({item.source_relative_path for item in bundle.prompts}) != 20:
+        raise ValueError("prompt selection must contain 20 unique source identities")
+    if prompt_ids != expected_prompt_ids:
+        raise ValueError("prompt selection IDs are not the exact canonical prompt set")
+    if set(bundle.benchmark_prompt_by_id) != benchmark_ids:
+        raise ValueError("benchmark assignment IDs do not exactly match the pinned benchmark")
+    if not set(bundle.benchmark_prompt_by_id.values()).issubset(prompt_ids):
+        raise ValueError("benchmark assignment has an unknown prompt reference")
+    if (
+        len(bundle.audio_log_ids) != 4
+        or len(set(bundle.audio_log_ids)) != 4
+        or not set(bundle.audio_log_ids).issubset(benchmark_ids)
+    ):
+        raise ValueError("audio-log IDs must be four unique pinned benchmark IDs")
+
+    selected = [*bundle.memorization, *bundle.prompts]
+    selected_rows = _selected_index_rows(index_path, [item.source_relative_path for item in selected])
+    combined_path = _selected_sidecar_path(index_path)
+    for item in bundle.memorization:
+        row = selected_rows.get(item.source_relative_path)
+        if (
+            row is None
+            or row["stage"] != 2
+            or row["agreement"] is None
+            or row["agreement"] < 0.95
+            or item.stage != 2
+            or item.agreement < 0.95
+        ):
+            raise ValueError("memorization selection contains a row outside stage-2 high-agreement eligibility")
+    for item in bundle.prompts:
+        row = selected_rows.get(item.source_relative_path)
+        if row is None or row["stage"] not in (1, 2) or row["agreement"] is None:
+            raise ValueError("prompt selection contains an ineligible row")
+
+    recomputed_fingerprint = fingerprint(
+        {
+            "schema_version": 1,
+            "seed": bundle.seed,
+            "index_fingerprint": index_fingerprint,
+            "memorization": [_selection_sample_fingerprint(item) for item in bundle.memorization],
+            "prompts": [_selection_sample_fingerprint(item) for item in bundle.prompts],
+            "benchmark_prompt_by_id": bundle.benchmark_prompt_by_id,
+            "audio_log_ids": bundle.audio_log_ids,
+        }
+    )
+    if recomputed_fingerprint != declared_fingerprint:
+        raise ValueError("selection fingerprint does not match actual manifest content and current inputs")
+    for number, item in enumerate(bundle.memorization):
+        _verify_selected_sample(
+            item,
+            selected_rows[item.source_relative_path],
+            combined_path,
+            root / "audio" / "memorization" / f"item-{number:02d}.wav",
+        )
+    for number, item in enumerate(bundle.prompts):
+        _verify_selected_sample(
+            item,
+            selected_rows[item.source_relative_path],
+            combined_path,
+            root / "audio" / "prompts" / f"prompt-{number:02d}.wav",
+        )
+    return {
+        "selection_fingerprint": recomputed_fingerprint,
+        "memorization_samples": len(bundle.memorization),
+        "validation_prompts": len(bundle.prompts),
+        "benchmark_assignments": len(bundle.benchmark_prompt_by_id),
+        "audio_log_ids": len(bundle.audio_log_ids),
+    }
+
+
+def _selected_index_rows(index_path: Path, identities: list[str]) -> dict[str, sqlite3.Row]:
+    unique_identities = sorted(set(identities))
+    placeholders = ",".join("?" for _ in unique_identities)
+    try:
+        with sqlite3.connect(index_path.as_uri() + "?mode=ro", uri=True) as database:
+            database.row_factory = sqlite3.Row
+            return {
+                row["source_relative_path"]: row
+                for row in database.execute(
+                    f"""
+                    SELECT source_relative_path, agreement, stage, sidecar_offset, sidecar_size
+                    FROM samples WHERE source_relative_path IN ({placeholders})
+                    """,
+                    unique_identities,
+                )
+            }
+    except sqlite3.Error as error:
+        raise ValueError("cannot validate selection identities against the prepared index") from error
+
+
+def _selected_sidecar_path(index_path: Path) -> Path:
+    try:
+        with sqlite3.connect(index_path.as_uri() + "?mode=ro", uri=True) as database:
+            row = database.execute("SELECT value FROM metadata WHERE key = 'sidecar_path'").fetchone()
+    except sqlite3.Error as error:
+        raise ValueError("cannot read selected sidecar identity from the prepared index") from error
+    if row is None or not isinstance(row[0], str) or not Path(row[0]).is_file():
+        raise ValueError("prepared index selected sidecar is unavailable")
+    return Path(row[0])
+
+
+def _verify_selected_sample(item: SelectedSample, row: sqlite3.Row, sidecar_path: Path, expected_wav: Path) -> None:
+    if item.stage != row["stage"] or item.agreement != row["agreement"]:
+        raise ValueError("selection stage/agreement does not match the prepared index")
+    if item.wav_path.resolve() != expected_wav.resolve() or not expected_wav.is_file():
+        raise ValueError("selection WAV path does not match the canonical bundle layout")
+    if sha256_file(expected_wav) != item.wav_sha256:
+        raise ValueError("selection WAV SHA-256 does not match the extracted artifact")
+    with sidecar_path.open("rb") as source:
+        source.seek(row["sidecar_offset"])
+        payload = source.read(row["sidecar_size"])
+    try:
+        sidecar = _mapping(json.loads(payload), "selected sidecar row")
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("selected sidecar row is malformed") from error
+    if sidecar.get("source_relative_path") != item.source_relative_path:
+        raise ValueError("selected sidecar row identity does not match the manifest")
+    if sidecar.get("rover_punctuated_accented") != item.text:
+        raise ValueError("selected manifest text does not match the immutable sidecar")
+
+
+def _selection_sample_fingerprint(item: SelectedSample) -> dict[str, Any]:
+    value = item.model_dump(mode="json")
+    value.pop("wav_path")
+    return value
 
 
 def _index_fingerprint(config: BalalaikaConfig) -> str:
