@@ -307,8 +307,8 @@ def run_memorization(config: Any, runtime: Any) -> MemorizationResult:
             for index, sample in enumerate(samples):
                 generated = target_model.generate(
                     target_text=sample.text,
-                    prompt_text=None,
-                    prompt_wav_path=None,
+                    prompt_text="",
+                    prompt_wav_path="",
                     seed=settings["seed"] + index,
                     cfg_value=generation_settings["cfg_value"],
                     inference_timesteps=generation_settings["inference_timesteps"],

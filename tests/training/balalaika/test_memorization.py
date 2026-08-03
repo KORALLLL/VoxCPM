@@ -43,9 +43,29 @@ class TinyModel(torch.nn.Module):
         anchor = self.lora_A.sum() * 0.0
         return {"loss/diff": anchor + value.float().mean(), "loss/stop": anchor + 0.5}
 
-    def generate(self, **kwargs):
+    def generate(
+        self,
+        target_text: str,
+        prompt_text: str = "",
+        prompt_wav_path: str = "",
+        *,
+        seed: int | None = None,
+        cfg_value: float = 2.0,
+        inference_timesteps: int = 10,
+        max_len: int = 2_000,
+    ):
         if not hasattr(self, "audio_vae"):
             raise RuntimeError("generation requires the retained AudioVAE")
+        len(prompt_wav_path)
+        kwargs = {
+            "target_text": target_text,
+            "prompt_text": prompt_text,
+            "prompt_wav_path": prompt_wav_path,
+            "seed": seed,
+            "cfg_value": cfg_value,
+            "inference_timesteps": inference_timesteps,
+            "max_len": max_len,
+        }
         self.events.append(("generate", kwargs))
         return np.zeros(160, dtype=np.float32)
 
@@ -347,7 +367,7 @@ def test_memorization_generates_without_prompt_and_logs_every_pair(mem_fixture):
 
     generation_calls = [event[1] for event in mem_fixture.events if event[0] == "generate"]
     assert len(generation_calls) == 4
-    assert all(call["prompt_text"] is None and call["prompt_wav_path"] is None for call in generation_calls)
+    assert all(call["prompt_text"] == "" and call["prompt_wav_path"] == "" for call in generation_calls)
     assert [call["target_text"] for call in generation_calls] == [sample["text"] for sample in mem_fixture.samples]
     assert all(call["cfg_value"] == 4.25 for call in generation_calls)
     assert all(call["inference_timesteps"] == 23 for call in generation_calls)
