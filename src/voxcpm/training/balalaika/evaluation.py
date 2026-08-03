@@ -120,6 +120,20 @@ def require_exact_complete(expected_ids: Iterable[int], complete_ids: Iterable[i
     return tuple(sorted(completed))
 
 
+def _generation_settings(value: Mapping[str, object] | Any | None) -> dict[str, object]:
+    if value is None:
+        raise ValueError("evaluator generation_settings are required")
+    if callable(getattr(value, "model_dump", None)):
+        value = value.model_dump(mode="json")
+    if not isinstance(value, Mapping):
+        raise ValueError("evaluator generation_settings must be a mapping")
+    settings = dict(value)
+    for name in ("cfg_value", "inference_timesteps", "max_length"):
+        if name not in settings:
+            raise ValueError(f"evaluator generation_settings are missing {name}")
+    return settings
+
+
 class DistributedEvaluator:
     """Coordinate one immutable full-validation boundary across all ranks.
 
@@ -141,6 +155,7 @@ class DistributedEvaluator:
         expected_item_count: int = 2_000,
         validation_root: str | Path | None = None,
         payload_factory: Callable[..., ValidationPayload] = ValidationPayload,
+        generation_settings: Mapping[str, object] | Any | None = None,
     ) -> None:
         if (
             isinstance(expected_item_count, bool)
@@ -187,6 +202,9 @@ class DistributedEvaluator:
         self.expected_item_count = expected_item_count
         self.validation_root = Path(validation_root) if validation_root is not None else ledger.root.parent
         self.payload_factory = payload_factory
+        self.generation_settings = _generation_settings(generation_settings)
+        if fingerprint(self.generation_settings) != self.ledger.generation_fingerprint:
+            raise ValueError("generation settings do not match the validation ledger fingerprint")
 
     def item_seed(self, item_id: int, checkpoint: object, boundary: object) -> int:
         """Return the caller-current deterministic seed for one item."""
@@ -364,29 +382,61 @@ class DistributedEvaluator:
             return self._payload_from_artifacts(context, record)
 
         local_status_path = self.ledger.root / "rank-status" / f"rank-{self.runtime.rank:02d}.json"
+        status_write_error: BaseException | None = None
+        run_error: BaseException | None = None
         try:
             completed = self.run_rank(model, audio_vae, checkpoint, boundary)
-            atomic_json(
-                local_status_path,
-                {
-                    "version": 1,
-                    "status": "success",
-                    "rank": self.runtime.rank,
-                    "input_fingerprint": context.input_fingerprint,
-                    "completed_ids": sorted(completed),
-                },
-            )
+            local_status = {
+                "version": 1,
+                "status": "success",
+                "rank": self.runtime.rank,
+                "input_fingerprint": context.input_fingerprint,
+                "completed_ids": sorted(completed),
+            }
         except Exception as error:
+            run_error = error
+            local_status = {
+                "version": 1,
+                "status": "failed",
+                "rank": self.runtime.rank,
+                "input_fingerprint": context.input_fingerprint,
+                "error": _error_snapshot(error),
+            }
+        finally:
+            run_outcome = torch.tensor([1 if run_error is None else 0], dtype=torch.int8, device=self.runtime.device)
+            self.runtime.gather(run_outcome)
+        try:
             atomic_json(
                 local_status_path,
-                {
-                    "version": 1,
-                    "status": "failed",
-                    "rank": self.runtime.rank,
-                    "input_fingerprint": context.input_fingerprint,
-                    "error": _error_snapshot(error),
-                },
+                local_status,
             )
+        except BaseException as error:
+            status_write_error = error
+        finally:
+            outcome = torch.tensor(
+                [1 if status_write_error is None else 0], dtype=torch.int8, device=self.runtime.device
+            )
+            outcomes = self.runtime.gather(outcome).reshape(-1)
+        if not bool((outcomes == 1).all().item()):
+            if self.runtime.rank == 0:
+                try:
+                    atomic_json(
+                        self.ledger.root / "validation-failed.json",
+                        {
+                            "version": 1,
+                            "status": "failed",
+                            "input_fingerprint": context.input_fingerprint,
+                            "error": _error_snapshot(
+                                status_write_error or RuntimeError("peer rank status publication failed")
+                            ),
+                        },
+                    )
+                except BaseException:
+                    pass
+            self.runtime.barrier()
+            raise RuntimeError(
+                "validation rank status publication failed: status write failure"
+            ) from status_write_error
         self.runtime.barrier()
 
         if self.runtime.rank == 0:
@@ -434,6 +484,9 @@ class DistributedEvaluator:
                         prompt_text=str(inputs["prompt_text"]),
                         prompt_wav_path=str(inputs["prompt_wav_path"]),
                         seed=seed,
+                        cfg_value=self.generation_settings["cfg_value"],
+                        inference_timesteps=self.generation_settings["inference_timesteps"],
+                        max_len=self.generation_settings["max_length"],
                     )
                     wav_path = self.ledger.wav_path(item_id, rank=self.runtime.rank)
                     _atomic_wav(wav_path, generated, _sample_rate(model))
@@ -529,6 +582,7 @@ class DistributedEvaluator:
             "boundary": boundary_value,
             "selection_fingerprint": str(getattr(self.selection, "fingerprint")),
             "generation_fingerprint": self.ledger.generation_fingerprint,
+            "generation_settings": self.generation_settings,
             "asr_fingerprint": self.ledger.asr_fingerprint,
             "rows": [asdict(row) for row in self.rows],
             "assignments": [[item_id, assignments[item_id]] for item_id in self._row_by_id],
@@ -551,6 +605,7 @@ class DistributedEvaluator:
                 "prompt_text": prompt["text"],
                 "prompt_wav_path": prompt["wav_path"],
                 "prompt_wav_sha256": prompt["wav_sha256"],
+                "generation_settings": self.generation_settings,
             }
             item_fingerprint = fingerprint(inputs)
             seed = int(fingerprint({"validation": input_fingerprint, "item": item_fingerprint})[:16], 16)

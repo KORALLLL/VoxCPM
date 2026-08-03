@@ -101,6 +101,23 @@ def _file_hashes(root: Path) -> dict[str, str]:
     }
 
 
+def _mark_generation(root: Path, role: str) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    (root / ".balalaika-generation").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "owner": "voxcpm-balalaika",
+                "role": role,
+                "canonical_root": str(root.resolve()),
+                "generation_id": "previous",
+                "status": "complete",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
 def test_runbook_uses_project_accelerate_launcher():
     repository_root = Path(__file__).resolve().parents[3]
     runbook = (repository_root / "docs" / "balalaika_training.md").read_text(encoding="utf-8")
@@ -166,7 +183,7 @@ def test_memorize_smoke_rejects_before_runtime_or_runner_side_effects(config_pat
 
 
 @pytest.mark.parametrize("runner_fails", [False, True])
-def test_real_memorization_closes_its_runtime_once_on_success_and_failure(config_path, runner_fails):
+def test_real_memorization_closes_its_runtime_once_on_success_and_failure(config_path, runner_fails, monkeypatch):
     """Catches the real memorization runtime owner leaking Accelerate resources on either exit path."""
     config = BalalaikaConfig.load(config_path)
     events: list[str] = []
@@ -187,6 +204,8 @@ def test_real_memorization_closes_its_runtime_once_on_success_and_failure(config
             large_training_started=False,
         )
 
+    monkeypatch.setattr(workflow_module, "_verified_pins", lambda _config: {})
+    monkeypatch.setattr(workflow_module, "_verify_current_prepared_generation", lambda _config: ("index", object()))
     commands = ProductionCommands(runtime_factory=lambda _config: Runtime(), memorization_runner=run)
 
     if runner_fails:
@@ -198,7 +217,7 @@ def test_real_memorization_closes_its_runtime_once_on_success_and_failure(config
     assert events == ["run", "close"]
 
 
-def test_memorization_preserves_runner_failure_when_runtime_close_also_fails(config_path):
+def test_memorization_preserves_runner_failure_when_runtime_close_also_fails(config_path, monkeypatch):
     """Catches teardown masking the operational failure that operators must diagnose."""
     config = BalalaikaConfig.load(config_path)
 
@@ -206,6 +225,8 @@ def test_memorization_preserves_runner_failure_when_runtime_close_also_fails(con
         def close(self):
             raise RuntimeError("close failed")
 
+    monkeypatch.setattr(workflow_module, "_verified_pins", lambda _config: {})
+    monkeypatch.setattr(workflow_module, "_verify_current_prepared_generation", lambda _config: ("index", object()))
     commands = ProductionCommands(
         runtime_factory=lambda _config: Runtime(),
         memorization_runner=lambda *_args: (_ for _ in ()).throw(ValueError("runner failed")),
@@ -454,7 +475,12 @@ def test_production_prepare_builds_index_then_fixed_selection(config_path, tmp_p
     result = commands.prepare(config)
 
     assert [event[0] for event in events] == ["expectations", "index", "selection"]
-    assert events[2][1] == (audit.index_path, benchmark, config.selection_dir, config.runtime.seed)
+    selected_index, selected_benchmark, selected_output, selected_seed = events[2][1]
+    assert selected_index == audit.index_path
+    assert selected_benchmark == benchmark
+    assert selected_output != config.selection_dir
+    assert selected_output.parent == config.selection_dir.parent
+    assert selected_seed == config.runtime.seed
     assert result.values["excluded_null_agreement"] == 309
     assert result.values["memorization_samples"] == 4
     assert result.values["validation_prompts"] == 20
@@ -475,7 +501,7 @@ def test_production_prepare_verifies_all_pins_before_reading_inputs(config_path,
 
     def build_index(data, _expectations):
         events.append("index")
-        data.index_dir.mkdir(parents=True)
+        data.index_dir.mkdir(parents=True, exist_ok=True)
         index_path = data.index_dir / "balalaika-index.sqlite3"
         index_path.write_bytes(b"new-index")
         audit_path = data.index_dir / "balalaika-index-audit.json"
@@ -519,12 +545,12 @@ def test_prepare_selection_failure_restores_previous_index_without_copying(confi
     benchmark = config.hub.local_dir / "benchmark" / config.hub.benchmark_file
     benchmark.parent.mkdir(parents=True)
     benchmark.write_text('{"id": 0}\n', encoding="utf-8")
-    config.data.index_dir.mkdir(parents=True)
+    _mark_generation(config.data.index_dir, "index")
     previous_index = config.data.index_dir / "balalaika-index.sqlite3"
     previous_index.write_bytes(b"previous-complete-index")
     previous_inode = previous_index.stat().st_ino
     (config.data.index_dir / "balalaika-index-audit.json").write_text('{"generation":"previous"}', encoding="utf-8")
-    config.selection_dir.mkdir(parents=True)
+    _mark_generation(config.selection_dir, "selection")
     (config.selection_dir / "complete-generation.txt").write_text("previous", encoding="utf-8")
 
     def build_index(data, _expectations):
@@ -568,12 +594,12 @@ def test_prepare_refuses_to_commit_missing_generation_outputs_and_restores_previ
     benchmark = config.hub.local_dir / "benchmark" / config.hub.benchmark_file
     benchmark.parent.mkdir(parents=True)
     benchmark.write_text('{"id": 0}\n', encoding="utf-8")
-    config.data.index_dir.mkdir(parents=True)
+    _mark_generation(config.data.index_dir, "index")
     previous_index = config.data.index_dir / "balalaika-index.sqlite3"
     previous_index.write_bytes(b"previous-complete-index")
     previous_inode = previous_index.stat().st_ino
     (config.data.index_dir / "balalaika-index-audit.json").write_text('{"generation":"previous"}', encoding="utf-8")
-    config.selection_dir.mkdir(parents=True)
+    _mark_generation(config.selection_dir, "selection")
     previous_selection = config.selection_dir / "memorization.json"
     previous_selection.write_text('{"generation":"previous"}', encoding="utf-8")
     monkeypatch.setattr(workflow_module, "_verified_pins", lambda _config: {})

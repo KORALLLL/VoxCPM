@@ -43,6 +43,7 @@ _APPROVAL_FINGERPRINT_FIELDS = frozenset(
         "data_fingerprint",
         "selection_fingerprint",
         "lora_fingerprint",
+        "generation_fingerprint",
         "checkpoint",
         "wandb_run_id",
         "wandb_completion",
@@ -118,6 +119,7 @@ class _RepeatDataset(Dataset[dict[str, Any]]):
 def run_memorization(config: Any, runtime: Any) -> MemorizationResult:
     """Overfit the published four-item selection, log diagnostics, and stop."""
     settings = _settings(config, runtime)
+    generation_settings = _memorization_generation_settings(config)
     selection_path, selection_fingerprint, samples = _load_selection(config)
     global_samples = settings["updates"] * settings["accumulation"] * settings["batch_size"] * runtime.world_size
     if global_samples < len(samples):
@@ -308,6 +310,9 @@ def run_memorization(config: Any, runtime: Any) -> MemorizationResult:
                     prompt_text=None,
                     prompt_wav_path=None,
                     seed=settings["seed"] + index,
+                    cfg_value=generation_settings["cfg_value"],
+                    inference_timesteps=generation_settings["inference_timesteps"],
+                    max_len=generation_settings["max_length"],
                 )
                 generated_path = generated_dir / f"item-{index:02d}.wav"
                 _atomic_wav(generated_path, generated, _sample_rate(target_model))
@@ -373,6 +378,7 @@ def run_memorization(config: Any, runtime: Any) -> MemorizationResult:
             "data_fingerprint": identity["data_fingerprint"],
             "selection_fingerprint": identity["selection_fingerprint"],
             "lora_fingerprint": identity["lora_fingerprint"],
+            "generation_fingerprint": fingerprint(generation_settings),
             "checkpoint": checkpoint_fingerprint,
             "wandb_run_id": run_id,
             "wandb_completion": sha256_file(wandb_completion_path),
@@ -391,6 +397,7 @@ def run_memorization(config: Any, runtime: Any) -> MemorizationResult:
             "generated_audio": [_artifact_value(path) for path in generated_tuple],
             "diagnostics": diagnostics,
             "losses": losses,
+            "generation_settings": generation_settings,
             "checkpoint": str(Path(checkpoint).resolve()),
             "selection_manifest": str(selection_path.resolve()),
             "wandb_completion": str(wandb_completion_path.resolve()),
@@ -514,6 +521,26 @@ def _settings(config: Any, runtime: Any) -> dict[str, Any]:
         raise MemorizationError("memorization weight_decay must be non-negative")
     if settings["accumulation"] != getattr(runtime, "accumulation", settings["accumulation"]):
         raise MemorizationError("runtime and memorization accumulation must match")
+    return settings
+
+
+def _memorization_generation_settings(config: Any) -> dict[str, object]:
+    value = getattr(config, "generation", None)
+    if value is None:
+        raise MemorizationError("configuration must define generation settings")
+    if callable(getattr(value, "model_dump", None)):
+        settings = dict(value.model_dump(mode="json"))
+    else:
+        settings = {
+            "cfg_value": getattr(value, "cfg_value", None),
+            "inference_timesteps": getattr(value, "inference_timesteps", None),
+            "max_length": getattr(value, "max_length", None),
+        }
+    if not isinstance(settings["cfg_value"], (int, float)):
+        raise MemorizationError("generation cfg_value must be numeric")
+    for name in ("inference_timesteps", "max_length"):
+        if isinstance(settings[name], bool) or not isinstance(settings[name], int) or settings[name] <= 0:
+            raise MemorizationError(f"generation {name} must be a positive integer")
     return settings
 
 

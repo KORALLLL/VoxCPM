@@ -255,6 +255,7 @@ def mem_fixture(tmp_path, monkeypatch):
             max_grad_norm=1.0,
             loss_weights={"loss/diff": 1.0, "loss/stop": 1.0},
         ),
+        generation=SimpleNamespace(cfg_value=4.25, inference_timesteps=23, max_length=999),
         wandb=SimpleNamespace(project="test", mode="online"),
     )
     runtime = FakeRuntime(events)
@@ -348,6 +349,12 @@ def test_memorization_generates_without_prompt_and_logs_every_pair(mem_fixture):
     assert len(generation_calls) == 4
     assert all(call["prompt_text"] is None and call["prompt_wav_path"] is None for call in generation_calls)
     assert [call["target_text"] for call in generation_calls] == [sample["text"] for sample in mem_fixture.samples]
+    assert all(call["cfg_value"] == 4.25 for call in generation_calls)
+    assert all(call["inference_timesteps"] == 23 for call in generation_calls)
+    assert all(call["max_len"] == 999 and "max_length" not in call for call in generation_calls)
+    assert result.fingerprints["generation_fingerprint"] == fingerprint(
+        {"cfg_value": 4.25, "inference_timesteps": 23, "max_length": 999}
+    )
     assert len(mem_fixture.run_manager.pairs) == 1
     logged_pairs, logged_step = mem_fixture.run_manager.pairs[0]
     assert logged_step == 8

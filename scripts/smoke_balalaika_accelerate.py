@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from voxcpm.training.balalaika.probe import probe_microbatch
 from voxcpm.training.balalaika.runtime import AccelerateRuntime
-from voxcpm.training.balalaika.artifacts import atomic_json, sha256_file
+from voxcpm.training.balalaika.artifacts import atomic_json, fingerprint, sha256_file
 from voxcpm.training.balalaika.evaluation import DistributedEvaluator
 from voxcpm.training.balalaika.ledger import ValidationLedger
 from voxcpm.training.balalaika.metrics import BenchmarkRow
@@ -646,9 +646,10 @@ def _run_validation(items: int) -> None:
         benchmark_prompt_by_id={row.id: prompt.prompt_id for row in rows},
         audio_log_ids=[0, 7, 16, 31],
     )
+    generation_settings = {"cfg_value": 2.0, "inference_timesteps": 2, "max_length": 64}
     ledger = ValidationLedger(
         root / "boundary-01",
-        generation_fingerprint="synthetic-generation-fingerprint",
+        generation_fingerprint=fingerprint(generation_settings),
         asr_fingerprint="synthetic-asr-fingerprint",
         max_attempts=2,
     )
@@ -664,6 +665,7 @@ def _run_validation(items: int) -> None:
         expected_item_count=items,
         validation_root=root,
         payload_factory=_smoke_payload,
+        generation_settings=generation_settings,
     )
     model = _SyntheticValidationModel()
     audio_vae = torch.nn.Identity()

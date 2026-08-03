@@ -822,8 +822,8 @@ def test_stage1_requires_an_injected_matching_manual_approval_before_model_setup
 def test_probe_runs_on_local_unwrapped_model_before_one_joint_prepare(tmp_path):
     observed = []
 
-    def selector(runtime, model, optimizer, stage_config):
-        observed.append((runtime.prepare_calls, model, optimizer, stage_config.batch_size))
+    def selector(runtime, model, optimizer, stage_config, dataset, processor):
+        observed.append((runtime.prepare_calls, model, optimizer, stage_config.batch_size, dataset, processor))
         return 1
 
     fixture = _make_trainer(tmp_path, microbatch_selector=selector)
@@ -833,7 +833,51 @@ def test_probe_runs_on_local_unwrapped_model_before_one_joint_prepare(tmp_path):
     assert observed[0][0] == 0
     assert observed[0][1] is fixture.models[0]
     assert observed[0][2] is fixture.optimizers[0]
+    assert len(observed[0][4]) == 80
+    assert callable(observed[0][5])
     assert fixture.runtime.prepare_calls == 1
+
+
+def test_signal_after_final_stage1_boundary_returns_transition_checkpoint(tmp_path):
+    """Catches final validation being superseded by a recovery checkpoint that stage 2 rejects."""
+    events = []
+    manager = FakeCheckpointManager(tmp_path / "checkpoints", events)
+
+    class StopAtFinalBoundary(FakeEvaluator):
+        trainer = None
+
+        def run(self, model, audio_vae, checkpoint, boundary):
+            result = super().run(model, audio_vae, checkpoint, boundary)
+            if boundary.epoch == 1 and boundary.boundary == 8:
+                assert self.trainer is not None
+                self.trainer.request_stop()
+            return result
+
+    evaluator = StopAtFinalBoundary(events)
+    stage1 = _make_trainer(
+        tmp_path,
+        stage1_rows=8,
+        runtime=FakeRuntime(events),
+        checkpoint_manager=manager,
+        evaluator=evaluator,
+    )
+    evaluator.trainer = stage1.trainer
+
+    transition = stage1.trainer.run_stage(1)
+
+    assert transition.name == "boundary-0016"
+    assert manager.recoveries == []
+    stage2_events = []
+    stage2_manager = FakeCheckpointManager(tmp_path / "stage2-checkpoints", stage2_events)
+    stage2 = _make_trainer(
+        tmp_path / "stage2",
+        stage2_rows=8,
+        runtime=FakeRuntime(stage2_events, signal_after_sync=1),
+        checkpoint_manager=stage2_manager,
+        stage1_checkpoint=transition,
+    )
+    stage2.trainer.run_stage(2)
+    assert ("stage2-adapter",) in stage2_events
 
 
 def test_remote_signal_saves_non_boundary_recovery_after_current_real_step(tmp_path):

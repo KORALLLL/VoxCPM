@@ -13,7 +13,7 @@ import pytest
 import torch
 
 from voxcpm.training.balalaika import evaluation as evaluation_module
-from voxcpm.training.balalaika.artifacts import atomic_json, sha256_file
+from voxcpm.training.balalaika.artifacts import atomic_json, fingerprint, sha256_file
 from voxcpm.training.balalaika.evaluation import (
     DistributedEvaluator,
     EvaluationIntegrityError,
@@ -40,12 +40,17 @@ class FakeRuntime:
         self.world_size = world_size
         self.device = torch.device("cpu")
         self.barriers = 0
+        self.gather_calls = 0
 
     def unwrap(self, model):
         return model
 
     def barrier(self) -> None:
         self.barriers += 1
+
+    def gather(self, value):
+        self.gather_calls += 1
+        return value
 
 
 class FakeVAE(torch.nn.Module):
@@ -156,9 +161,10 @@ def _fixture(
         audio_log_ids=audio_ids,
     )
     runtime = FakeRuntime(rank=rank, world_size=world_size)
+    generation_settings = {"cfg_value": 3.5, "inference_timesteps": 17, "max_length": 777}
     ledger = ValidationLedger(
         tmp_path / f"boundary-{boundary_index:02d}",
-        generation_fingerprint="generation-fingerprint",
+        generation_fingerprint=fingerprint(generation_settings),
         asr_fingerprint="asr-fingerprint",
         max_attempts=3,
         claim_timeout_seconds=3_600,
@@ -175,6 +181,7 @@ def _fixture(
         expected_item_count=item_count,
         validation_root=tmp_path,
         payload_factory=_fake_payload,
+        generation_settings=generation_settings,
     )
     return Fixture(
         evaluator=evaluator,
@@ -379,6 +386,44 @@ def test_resume_reuses_only_current_hash_matching_items(tmp_path: Path) -> None:
     assert [call["target_text"] for call in fixture.model.calls] == ["но́мер 2"]
 
 
+def test_generation_passes_all_configured_voxcpm2_arguments_and_binds_identity(tmp_path: Path) -> None:
+    """Catches generation defaults replacing configured VoxCPM2 inference settings or using max_length."""
+    fixture = _fixture(tmp_path)
+
+    fixture.evaluator.run_rank(fixture.model, fixture.vae, fixture.checkpoint, fixture.boundary)
+
+    assert fixture.model.calls
+    for call in fixture.model.calls:
+        assert call["cfg_value"] == 3.5
+        assert call["inference_timesteps"] == 17
+        assert call["max_len"] == 777
+        assert "max_length" not in call
+    context = fixture.evaluator._context(fixture.checkpoint, fixture.boundary)
+    assert context.item_inputs[0]["generation_settings"] == {
+        "cfg_value": 3.5,
+        "inference_timesteps": 17,
+        "max_length": 777,
+    }
+
+
+def test_rank_status_write_failure_reaches_outcome_collective_before_error(tmp_path: Path, monkeypatch) -> None:
+    """Catches one rank leaving before peers when its durable status file cannot be written."""
+    fixture = _fixture(tmp_path)
+    real_atomic_json = evaluation_module.atomic_json
+
+    def fail_rank_status(path: Path, value: dict[str, object]) -> None:
+        if Path(path).parent.name == "rank-status":
+            raise OSError("injected rank status write failure")
+        real_atomic_json(path, value)
+
+    monkeypatch.setattr(evaluation_module, "atomic_json", fail_rank_status)
+
+    with pytest.raises(RuntimeError, match="status write failure|status publication"):
+        fixture.evaluator.run(fixture.model, fixture.vae, fixture.checkpoint, fixture.boundary)
+
+    assert fixture.runtime.gather_calls >= 1
+
+
 def test_full_run_scores_empty_asr_logs_then_completes_in_fixed_audio_order(tmp_path: Path, monkeypatch) -> None:
     """Catches empty ASR being dropped, W&B/completion inversion, or drift in the four fixed audio IDs."""
     fixture = _fixture(tmp_path)
@@ -541,6 +586,7 @@ def test_resume_retention_failure_crosses_the_same_barrier_and_reaches_every_ran
         expected_item_count=4,
         validation_root=tmp_path,
         payload_factory=_fake_payload,
+        generation_settings={"cfg_value": 3.5, "inference_timesteps": 17, "max_length": 777},
     )
 
     def fail_retention() -> None:

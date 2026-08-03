@@ -7,13 +7,31 @@ import sqlite3
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 import voxcpm.training.balalaika.workflow as workflow_module
 from voxcpm.training.balalaika.artifacts import fingerprint, sha256_file
 from voxcpm.training.balalaika.config import BalalaikaConfig, DataConfig
-from voxcpm.training.balalaika.index import build_index
+from voxcpm.training.balalaika.index import IndexAudit, build_index
 from voxcpm.training.balalaika.selection import create_selection_manifests
 from voxcpm.training.balalaika.workflow import ProductionCommands
+
+
+def _generation_marker(root: Path, role: str, generation_id: str = "previous") -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    (root / ".balalaika-generation").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "owner": "voxcpm-balalaika",
+                "role": role,
+                "canonical_root": str(root.resolve()),
+                "generation_id": generation_id,
+                "status": "complete",
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 @pytest.fixture
@@ -368,6 +386,427 @@ def test_deep_audit_rejects_changed_pinned_file(prepared_deep_audit):
         commands.audit(prepared_deep_audit)
 
 
+@pytest.mark.parametrize("relation", ["equal", "descendant", "ancestor"])
+def test_preparation_rejects_generation_roots_overlapping_immutable_corpus(tmp_path, relation):
+    """Catches preparation gaining a recursive rename/delete path into the immutable corpus."""
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    candidate = {"equal": corpus, "descendant": corpus / "generated", "ancestor": tmp_path}[relation]
+    config = BalalaikaConfig.model_validate(
+        {
+            "data": {"corpus_root": corpus, "index_dir": candidate},
+            "output_dir": tmp_path / "runs",
+            "selection_dir": tmp_path / "selection",
+        }
+    )
+
+    with pytest.raises(ValueError, match="immutable corpus"):
+        workflow_module._PreparationTransaction(config)
+
+
+def test_preparation_rejects_symlink_and_nested_generation_roots(tmp_path):
+    """Catches resolved symlinks and ancestor roots bypassing destructive-path validation."""
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    target = tmp_path / "target"
+    target.mkdir()
+    link = tmp_path / "linked-index"
+    link.symlink_to(target, target_is_directory=True)
+    symlink_config = BalalaikaConfig.model_validate(
+        {
+            "data": {"corpus_root": corpus, "index_dir": link},
+            "output_dir": tmp_path / "runs",
+            "selection_dir": tmp_path / "selection",
+        }
+    )
+    nested_config = symlink_config.model_copy(
+        update={
+            "data": symlink_config.data.model_copy(update={"index_dir": tmp_path / "generation"}),
+            "selection_dir": tmp_path / "generation" / "selection",
+        }
+    )
+
+    with pytest.raises(ValueError, match="symlink"):
+        workflow_module._PreparationTransaction(symlink_config)
+    with pytest.raises(ValueError, match="overlap"):
+        workflow_module._PreparationTransaction(nested_config)
+
+
+def test_preparation_refuses_to_replace_unmarked_existing_directory(tmp_path):
+    """Catches arbitrary operator directories being treated as disposable pipeline generations."""
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    index_root = tmp_path / "index"
+    index_root.mkdir()
+    (index_root / "operator.txt").write_text("keep", encoding="utf-8")
+    config = BalalaikaConfig.model_validate(
+        {
+            "data": {"corpus_root": corpus, "index_dir": index_root},
+            "output_dir": tmp_path / "runs",
+            "selection_dir": tmp_path / "selection",
+        }
+    )
+
+    with pytest.raises(ValueError, match="generation marker"):
+        with workflow_module._PreparationTransaction(config):
+            pass
+
+    assert (index_root / "operator.txt").read_text(encoding="utf-8") == "keep"
+
+
+def test_prepare_keeps_previous_generation_live_until_validated_publish(tmp_path, monkeypatch):
+    """Catches a long build hiding both live roots before its replacement is ready."""
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    index_root = tmp_path / "index"
+    selection_root = tmp_path / "selection"
+    _generation_marker(index_root, "index")
+    _generation_marker(selection_root, "selection")
+    (index_root / "old.txt").write_text("old-index", encoding="utf-8")
+    (selection_root / "old.txt").write_text("old-selection", encoding="utf-8")
+    benchmark = tmp_path / "hub" / "benchmark" / "data.jsonl"
+    benchmark.parent.mkdir(parents=True)
+    benchmark.write_text("{}\n", encoding="utf-8")
+    config = BalalaikaConfig.model_validate(
+        {
+            "data": {"corpus_root": corpus, "index_dir": index_root},
+            "output_dir": tmp_path / "runs",
+            "selection_dir": selection_root,
+            "hub": {"local_dir": tmp_path / "hub"},
+        }
+    )
+
+    def build_index(data, _expectations):
+        assert (index_root / "old.txt").read_text(encoding="utf-8") == "old-index"
+        assert (selection_root / "old.txt").read_text(encoding="utf-8") == "old-selection"
+        assert data.index_dir != index_root
+        data.index_dir.mkdir(parents=True, exist_ok=True)
+        index_path = data.index_dir / "balalaika-index.sqlite3"
+        audit_path = data.index_dir / "balalaika-index-audit.json"
+        index_path.write_bytes(b"new-index")
+        audit_path.write_text("{}", encoding="utf-8")
+        return IndexAudit(index_path, audit_path, "index-fingerprint", 45, 44, 14, 30, 1)
+
+    def build_selection(_index, _benchmark, output_dir, _seed):
+        assert output_dir != selection_root
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "new.txt").write_text("new-selection", encoding="utf-8")
+        return SimpleNamespace(
+            fingerprint="selection-fingerprint",
+            memorization=[1, 2, 3, 4],
+            prompts=list(range(20)),
+            benchmark_prompt_by_id={item: "prompt-00" for item in range(2_000)},
+        )
+
+    monkeypatch.setattr(workflow_module, "_verified_pins", lambda _config: {})
+    commands = ProductionCommands(
+        expectation_loader=lambda _data: object(),
+        index_builder=build_index,
+        selection_builder=build_selection,
+        generation_validator=lambda *_args: None,
+    )
+
+    commands.prepare(config)
+
+    assert not (index_root / "old.txt").exists()
+    assert (index_root / "balalaika-index.sqlite3").read_bytes() == b"new-index"
+    assert (selection_root / "new.txt").read_text(encoding="utf-8") == "new-selection"
+
+
+def test_prepare_startup_recovers_interrupted_build_without_hiding_live_generation(tmp_path, monkeypatch):
+    """Catches host-loss staging residue blocking restart or replacing the last complete generation."""
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    index_root = tmp_path / "index"
+    selection_root = tmp_path / "selection"
+    _generation_marker(index_root, "index")
+    _generation_marker(selection_root, "selection")
+    (index_root / "old.txt").write_text("old-index", encoding="utf-8")
+    (selection_root / "old.txt").write_text("old-selection", encoding="utf-8")
+    output = tmp_path / "runs"
+    output.mkdir()
+    transaction_id = "interrupted"
+    stage_index = tmp_path / f".index.generation-{transaction_id}"
+    stage_selection = tmp_path / f".selection.generation-{transaction_id}"
+    for root, role, canonical in (
+        (stage_index, "index", index_root),
+        (stage_selection, "selection", selection_root),
+    ):
+        root.mkdir()
+        (root / ".balalaika-generation").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "owner": "voxcpm-balalaika",
+                    "role": role,
+                    "canonical_root": str(canonical.resolve()),
+                    "generation_id": transaction_id,
+                    "status": "building",
+                }
+            ),
+            encoding="utf-8",
+        )
+        (root / "partial.txt").write_text("partial", encoding="utf-8")
+    journal = {
+        "schema_version": 1,
+        "owner": "voxcpm-balalaika",
+        "transaction_id": transaction_id,
+        "phase": "building",
+        "roots": {
+            "index": {
+                "live": str(index_root.resolve()),
+                "stage": str(stage_index.resolve()),
+                "backup": str((tmp_path / f".index.previous-{transaction_id}").resolve()),
+            },
+            "selection": {
+                "live": str(selection_root.resolve()),
+                "stage": str(stage_selection.resolve()),
+                "backup": str((tmp_path / f".selection.previous-{transaction_id}").resolve()),
+            },
+        },
+    }
+    (output / ".prepare-transaction.json").write_text(json.dumps(journal), encoding="utf-8")
+    benchmark = tmp_path / "hub" / "benchmark" / "data.jsonl"
+    benchmark.parent.mkdir(parents=True)
+    benchmark.write_text("{}\n", encoding="utf-8")
+    config = BalalaikaConfig.model_validate(
+        {
+            "data": {"corpus_root": corpus, "index_dir": index_root},
+            "output_dir": output,
+            "selection_dir": selection_root,
+            "hub": {"local_dir": tmp_path / "hub"},
+        }
+    )
+    monkeypatch.setattr(workflow_module, "_verified_pins", lambda _config: {})
+    commands = ProductionCommands(
+        expectation_loader=lambda _data: object(),
+        index_builder=lambda *_args: (_ for _ in ()).throw(RuntimeError("stop after recovery")),
+    )
+
+    with pytest.raises(RuntimeError, match="stop after recovery"):
+        commands.prepare(config)
+
+    assert not stage_index.exists()
+    assert not stage_selection.exists()
+    assert not (output / ".prepare-transaction.json").exists()
+    assert (index_root / "old.txt").read_text(encoding="utf-8") == "old-index"
+    assert (selection_root / "old.txt").read_text(encoding="utf-8") == "old-selection"
+
+
+def test_preparation_journals_before_creating_any_staging_directory(tmp_path, monkeypatch):
+    """Catches SIGKILL leaving an unjournaled sibling generation before recovery can identify it."""
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    config = BalalaikaConfig.model_validate(
+        {
+            "data": {"corpus_root": corpus, "index_dir": tmp_path / "index"},
+            "output_dir": tmp_path / "runs",
+            "selection_dir": tmp_path / "selection",
+        }
+    )
+    observed: dict[str, bool] = {}
+
+    def stop_at_journal(transaction, phase):
+        observed["stage_exists"] = any(path.exists() for path in transaction._stage.values())
+        raise RuntimeError(f"stop at {phase} journal")
+
+    monkeypatch.setattr(workflow_module._PreparationTransaction, "_write_journal", stop_at_journal)
+
+    with pytest.raises(RuntimeError, match="stop at building journal"):
+        with workflow_module._PreparationTransaction(config):
+            pass
+
+    assert observed == {"stage_exists": False}
+    assert not tuple(tmp_path.glob(".*.generation-*"))
+
+
+def test_preparation_startup_finishes_interrupted_publication_before_new_build(tmp_path):
+    """Catches a host loss between the two generation renames leaving a mixed live pair."""
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    index_root = tmp_path / "index"
+    selection_root = tmp_path / "selection"
+    output = tmp_path / "runs"
+    output.mkdir()
+    transaction_id = "publishing"
+    stage_index = tmp_path / f".index.generation-{transaction_id}"
+    stage_selection = tmp_path / f".selection.generation-{transaction_id}"
+    backup_index = tmp_path / f".index.previous-{transaction_id}"
+    backup_selection = tmp_path / f".selection.previous-{transaction_id}"
+
+    def marker(root: Path, role: str, generation: str, status: str = "complete") -> None:
+        root.mkdir(parents=True, exist_ok=True)
+        (root / ".balalaika-generation").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "owner": "voxcpm-balalaika",
+                    "role": role,
+                    "canonical_root": str((index_root if role == "index" else selection_root).resolve()),
+                    "generation_id": generation,
+                    "status": status,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    marker(index_root, "index", transaction_id)
+    (index_root / "new.txt").write_text("new-index", encoding="utf-8")
+    marker(backup_index, "index", "previous")
+    (backup_index / "old.txt").write_text("old-index", encoding="utf-8")
+    marker(selection_root, "selection", "previous")
+    (selection_root / "old.txt").write_text("old-selection", encoding="utf-8")
+    marker(stage_selection, "selection", transaction_id)
+    (stage_selection / "new.txt").write_text("new-selection", encoding="utf-8")
+    journal = {
+        "schema_version": 1,
+        "owner": "voxcpm-balalaika",
+        "transaction_id": transaction_id,
+        "phase": "publishing",
+        "roots": {
+            "index": {
+                "live": str(index_root.resolve()),
+                "stage": str(stage_index.resolve()),
+                "backup": str(backup_index.resolve()),
+            },
+            "selection": {
+                "live": str(selection_root.resolve()),
+                "stage": str(stage_selection.resolve()),
+                "backup": str(backup_selection.resolve()),
+            },
+        },
+    }
+    (output / ".prepare-transaction.json").write_text(json.dumps(journal), encoding="utf-8")
+    config = BalalaikaConfig.model_validate(
+        {
+            "data": {"corpus_root": corpus, "index_dir": index_root},
+            "output_dir": output,
+            "selection_dir": selection_root,
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="stop new build"):
+        with workflow_module._PreparationTransaction(config):
+            raise RuntimeError("stop new build")
+
+    assert (index_root / "new.txt").read_text(encoding="utf-8") == "new-index"
+    assert (selection_root / "new.txt").read_text(encoding="utf-8") == "new-selection"
+    assert not backup_index.exists()
+    assert not backup_selection.exists()
+    assert not (output / ".prepare-transaction.json").exists()
+
+
+def test_precommit_validation_enforces_configured_exact_counts(prepared_deep_audit):
+    """Catches builder declarations bypassing the independently configured count gate."""
+    summary = ProductionCommands().audit(prepared_deep_audit).values
+    audit = IndexAudit(
+        prepared_deep_audit.data.index_dir / "balalaika-index.sqlite3",
+        prepared_deep_audit.data.index_dir / "balalaika-index-audit.json",
+        summary["fingerprint"],
+        summary["joined_rows"],
+        summary["eligible_rows"],
+        summary["stage1_rows"],
+        summary["stage2_rows"],
+        summary["excluded_null_agreement"],
+    )
+    selection = workflow_module._load_selection(prepared_deep_audit.selection_dir)
+    wrong = prepared_deep_audit.model_copy(
+        update={
+            "data": prepared_deep_audit.data.model_copy(
+                update={"expected_stage1_rows": prepared_deep_audit.data.expected_stage1_rows - 1}
+            )
+        }
+    )
+
+    with pytest.raises(ValueError, match="stage-1 row count"):
+        workflow_module._validate_prepared_generation(wrong, audit, selection)
+
+
+@pytest.mark.parametrize("tamper", ["sqlite", "selection"])
+def test_memorize_verifies_complete_prepared_generation_before_runtime(prepared_deep_audit, tamper):
+    """Catches self-declared prepared artifacts reaching model/runtime setup after tampering."""
+    if tamper == "sqlite":
+        index_path = prepared_deep_audit.data.index_dir / "balalaika-index.sqlite3"
+        index_path.write_bytes(index_path.read_bytes() + b"tampered")
+    else:
+        path = prepared_deep_audit.selection_dir / "prompts.json"
+        value = json.loads(path.read_text(encoding="utf-8"))
+        value["prompts"][0]["text"] = "tampered canonical content"
+        path.write_text(json.dumps(value), encoding="utf-8")
+    runtime_calls = []
+    commands = ProductionCommands(
+        runtime_factory=lambda _config: runtime_calls.append("runtime") or SimpleNamespace(close=lambda: None),
+        memorization_runner=lambda *_args: SimpleNamespace(
+            status="complete",
+            result_path=Path("unused"),
+            checkpoint=Path("unused"),
+            wandb_run_id="unused",
+            large_training_started=False,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="index|selection|SHA-256|hash"):
+        commands.memorize(prepared_deep_audit, smoke=False)
+
+    assert runtime_calls == []
+
+
+def test_production_microbatch_selector_probes_longest_rows_and_honors_fixed_bypass(tmp_path, monkeypatch):
+    """Catches production leaving candidate/fixed microbatch configuration disconnected from startup probing."""
+    index_root = tmp_path / "index"
+    index_root.mkdir()
+    with sqlite3.connect(index_root / "balalaika-index.sqlite3") as database:
+        database.executescript("""
+            CREATE TABLE samples (sample_id INTEGER PRIMARY KEY, source_relative_path TEXT, duration REAL);
+            CREATE TABLE stage_ordinals (stage INTEGER, ordinal INTEGER, sample_id INTEGER);
+            """)
+        database.executemany(
+            "INSERT INTO samples VALUES (?, ?, ?)",
+            [(1, "short.wav", 1.0), (2, "long.wav", 9.0)],
+        )
+        database.executemany("INSERT INTO stage_ordinals VALUES (1, ?, ?)", [(0, 1), (1, 2)])
+    config = BalalaikaConfig.model_validate(
+        {
+            "data": {"corpus_root": tmp_path / "corpus", "index_dir": index_root},
+            "output_dir": tmp_path / "runs",
+            "selection_dir": tmp_path / "selection",
+            "runtime": {"batch_candidates": [1, 2], "accumulation": 1},
+        }
+    )
+    monkeypatch.setattr(workflow_module, "VoxCPMCollator", lambda: lambda rows: torch.tensor(rows, dtype=torch.float32))
+
+    class Runtime:
+        device = torch.device("cpu")
+
+        @staticmethod
+        def unwrap(model):
+            return model
+
+        @staticmethod
+        def gather(value):
+            return value
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lora_A = torch.nn.Parameter(torch.tensor(1.0))
+
+        def forward(self, value, *, progress):
+            del progress
+            return {"loss/diff": self.lora_A * value.sum()}
+
+    model = Model()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    dataset = [1.0, 9.0]
+    selector = workflow_module._production_microbatch_selector(config, 1)
+
+    assert selector(Runtime(), model, optimizer, config.stage1, dataset, lambda batch: {"value": batch}) == 2
+
+    fixed = config.model_copy(update={"runtime": config.runtime.model_copy(update={"fixed_microbatch": 3})})
+    bypass = workflow_module._production_microbatch_selector(fixed, 1)
+    assert bypass(Runtime(), model, optimizer, fixed.stage1, object(), lambda _batch: {}) == 3
+
+
 @pytest.mark.parametrize("trainer_fails", [False, True])
 def test_configured_training_finishes_tracking_then_closes_runtime_once(tmp_path, monkeypatch, trainer_fails):
     """Catches production training leaking Accelerate or closing it before W&B cleanup on either exit path."""
@@ -401,6 +840,7 @@ def test_configured_training_finishes_tracking_then_closes_runtime_once(tmp_path
 
     class Trainer:
         def __init__(self, *_args, **_kwargs):
+            assert callable(_kwargs["microbatch_selector"])
             events.append("trainer-init")
 
         def run_stage(self, _stage):
@@ -419,6 +859,11 @@ def test_configured_training_finishes_tracking_then_closes_runtime_once(tmp_path
         },
     )
     monkeypatch.setattr(workflow_module, "_index_fingerprint", lambda _config: "index-fingerprint")
+    monkeypatch.setattr(
+        workflow_module,
+        "_verify_current_prepared_generation",
+        lambda _config: ("index-fingerprint", SimpleNamespace(fingerprint="selection-fingerprint")),
+    )
     monkeypatch.setattr(
         workflow_module,
         "_load_selection",
@@ -475,6 +920,11 @@ def test_configured_training_closes_runtime_when_tracking_setup_fails(tmp_path, 
         },
     )
     monkeypatch.setattr(workflow_module, "_index_fingerprint", lambda _config: "index-fingerprint")
+    monkeypatch.setattr(
+        workflow_module,
+        "_verify_current_prepared_generation",
+        lambda _config: ("index-fingerprint", SimpleNamespace(fingerprint="selection-fingerprint")),
+    )
     monkeypatch.setattr(
         workflow_module,
         "_load_selection",

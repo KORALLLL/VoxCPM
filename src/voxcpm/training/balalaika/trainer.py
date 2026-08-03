@@ -168,7 +168,13 @@ class BalalaikaTrainer:
         batch_processor_factory: Callable[[torch.nn.Module, torch.nn.Module, Any], Callable[..., Any]] | None = None,
         optimizer_factory: Callable[..., torch.optim.Optimizer] | None = None,
         scheduler_factory: Callable[..., Any] | None = None,
-        microbatch_selector: Callable[[Any, torch.nn.Module, torch.optim.Optimizer, Any], int] | None = None,
+        microbatch_selector: (
+            Callable[
+                [Any, torch.nn.Module, torch.optim.Optimizer, Any, Any, Callable[[Any], Mapping[str, torch.Tensor]]],
+                int,
+            ]
+            | None
+        ) = None,
         boundary_marker: Callable[[EvaluationBoundary, Path], Path] | None = None,
         accumulation: int = 1,
         workers: int = 0,
@@ -276,12 +282,20 @@ class BalalaikaTrainer:
         )
         self.optimizer = optimizer
 
+        dataset = self.dataset_factory(self.config, stage, tokenizer)
+        processor = self.batch_processor_factory(model, audio_vae, self.runtime)
         microbatch = _positive_integer(getattr(stage_config, "batch_size"), f"{stage_name}.batch_size")
         if self.microbatch_selector is not None:
-            selected = self.microbatch_selector(self.runtime, model, optimizer, stage_config)
+            selected = self.microbatch_selector(
+                self.runtime,
+                model,
+                optimizer,
+                stage_config,
+                dataset,
+                processor,
+            )
             microbatch = _positive_integer(selected, "selected microbatch")
 
-        dataset = self.dataset_factory(self.config, stage, tokenizer)
         geometry = EpochGeometry.from_counts(len(dataset), self.runtime.world_size, microbatch, self.accumulation)
         stage_start_global_step = progress.global_step
         if stage == 2 and self.resume_checkpoint is not None:
@@ -319,8 +333,6 @@ class BalalaikaTrainer:
             total_steps=total_steps,
         )
         self.scheduler = scheduler
-        processor = self.batch_processor_factory(model, audio_vae, self.runtime)
-
         prepared = self.runtime.prepare(model, optimizer, loader, scheduler)
         if not isinstance(prepared, tuple) or len(prepared) != 4:
             raise TypeError("runtime.prepare(model, optimizer, loader, scheduler) must return four objects")
@@ -482,6 +494,10 @@ class BalalaikaTrainer:
                             self._finish_boundary(model, audio_vae, checkpoint, boundary)
 
                         if self._synchronized_stop_requested():
+                            if progress.optimizer_step == total_steps and progress.boundary == 8:
+                                if self.last_durable_checkpoint is None:
+                                    raise TrainerConfigurationError("completed stage has no final boundary checkpoint")
+                                return self.last_durable_checkpoint
                             return self._save_recovery(model, progress, checkpoint_metadata, reason="signal")
         except BaseException as error:
             if isinstance(error, TrainingRestartRequired):
