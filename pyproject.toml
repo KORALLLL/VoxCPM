@@ -72,6 +72,7 @@ balalaika = [
 
 [project.scripts]
 voxcpm = "voxcpm.cli:main"
+voxcpm-balalaika = "voxcpm.training.balalaika.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/OpenBMB/VoxCPM"

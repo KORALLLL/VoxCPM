@@ -601,6 +601,14 @@ python lora_ft_webui.py   # then open http://localhost:7860
 
 > **Full guide →** [Fine-tuning Guide](https://voxcpm.readthedocs.io/en/latest/finetuning/finetune.html) (data preparation, configuration, training, LoRA hot-swapping, FAQ)
 
+The repository also contains a guarded, resumable two-stage LoRA pipeline for
+the internal Balalaika Russian corpus. It pins every remote input, indexes the
+corpus without modifying it, requires manual review of a four-example W&B
+memorization run, and permits stage 2 only from a verified final stage-1
+adapter. See the [Balalaika operator runbook](docs/balalaika_training.md); do
+not start this multi-GPU workflow without access to its private inputs and an
+operator-approved memorization result.
+
 ---
 
 ## 📚 Documentation

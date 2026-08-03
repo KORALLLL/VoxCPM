@@ -1,0 +1,90 @@
+data:
+  corpus_root: /workspace/balalaika_proprietary_v2
+  index_dir: /workspace/balalaika_lora_training/index
+  verification_manifest: /workspace/balalaika_proprietary_v2/verification.json
+  combined_metadata: /workspace/balalaika_proprietary_v2/combined_sidecars/rover-punctuation-stress-v1/rover-punctuation-stress.meta.json
+  expected_shards: 519
+  expected_rows: 4075032
+  expected_null_agreement: 309
+
+output_dir: /workspace/balalaika_lora_training/runs
+selection_dir: /workspace/balalaika_lora_training/selection
+
+hub:
+  model_repo_id: OpenBMB/VoxCPM2
+  benchmark_repo_id: bitmanagerai/hard_number_eval_for_tts
+  gigaam_repo_id: istupakov/gigaam-v3-onnx
+  local_dir: /workspace/balalaika_lora_training/hub
+  benchmark_file: data.jsonl
+
+lora:
+  enable_lm: true
+  enable_dit: true
+  enable_proj: false
+  r: 32
+  alpha: 32
+  dropout: 0.0
+
+stage1:
+  agreement: lt
+  threshold: 0.95
+  epochs: 2
+  learning_rate: 0.0001
+  batch_size: 1
+
+stage2:
+  agreement: ge
+  threshold: 0.95
+  epochs: 3
+  learning_rate: 0.00005
+  batch_size: 1
+
+runtime:
+  accumulation: 4
+  workers: 4
+  seed: 20260802
+  batch_candidates: [1, 2, 4]
+  fixed_microbatch: null
+  cpu: false
+
+optimization:
+  scheduler: cosine
+  warmup_fraction: 0.03
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  loss_weights:
+    loss/diff: 1.0
+    loss/stop: 1.0
+
+memorization:
+  updates: 256
+  learning_rate: 0.0001
+  batch_size: 1
+  accumulation: 4
+  seed: 20260802
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  loss_weights:
+    loss/diff: 1.0
+    loss/stop: 1.0
+
+generation:
+  cfg_value: 2.0
+  inference_timesteps: 10
+  max_length: 2048
+  retries: 3
+  seed: 20260802
+
+validation:
+  benchmark_size: 2000
+  prompt_count: 20
+  audio_log_count: 4
+  retries: 3
+  keep_full_boundaries: 1
+
+wandb:
+  project: voxcpm-balalaika
+  entity: null
+  mode: online
+  group: balalaika-voxcpm2-lora
+  dir: /workspace/balalaika_lora_training/wandb
