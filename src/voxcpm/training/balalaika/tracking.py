@@ -176,11 +176,62 @@ class NullRunManager:
     ) -> None:
         return None
 
-    def log_memorization(self, pairs: Sequence[Mapping[str, object]], global_step: int) -> None:
+    def log_memorization(self, pairs: Sequence[Mapping[str, object]], global_step: int) -> Mapping[str, object] | None:
         return None
 
     def finish(self) -> None:
         return None
+
+
+def memorization_pair_payload(
+    pairs: Sequence[Mapping[str, object]],
+    *,
+    global_step: int,
+    run_id: str,
+    mode: str,
+) -> dict[str, object]:
+    """Build the canonical local evidence for one exact four-pair W&B upload."""
+    materialized = [dict(pair) for pair in pairs]
+    identities = [pair.get("sample_id") for pair in materialized]
+    if (
+        len(materialized) != 4
+        or len(set(identities)) != 4
+        or not all(isinstance(identity, str) and identity for identity in identities)
+    ):
+        raise ValueError("Memorization logging requires exactly four distinct sample identities.")
+    if not isinstance(run_id, str) or not run_id:
+        raise ValueError("Memorization logging requires a non-empty W&B run identity.")
+    if mode != "online":
+        raise RuntimeError("Memorization logging requires online W&B mode.")
+    records: list[dict[str, object]] = []
+    for pair in materialized:
+        text = pair.get("text")
+        hypothesis = pair.get("asr_hypothesis")
+        reference_path = Path(str(pair.get("reference_audio", ""))).resolve()
+        generated_path = Path(str(pair.get("generated_audio", ""))).resolve()
+        if not isinstance(text, str) or not text or not isinstance(hypothesis, str):
+            raise ValueError("Memorization logging requires text and diagnostic transcript strings.")
+        if not reference_path.is_file() or not generated_path.is_file():
+            raise FileNotFoundError("Memorization logging requires complete local reference/generated WAV pairs.")
+        if reference_path.suffix.lower() != ".wav" or generated_path.suffix.lower() != ".wav":
+            raise ValueError("Memorization logging requires WAV reference/generated pairs.")
+        records.append(
+            {
+                "sample_id": pair["sample_id"],
+                "text": text,
+                "asr_hypothesis": hypothesis,
+                "reference_audio": {"path": str(reference_path), "sha256": sha256_file(reference_path)},
+                "generated_audio": {"path": str(generated_path), "sha256": sha256_file(generated_path)},
+            }
+        )
+    return {
+        "version": 1,
+        "job_type": "memorization",
+        "run_id": run_id,
+        "mode": mode,
+        "global_step": int(global_step),
+        "pairs": records,
+    }
 
 
 class WandbRunManager:
@@ -240,16 +291,17 @@ class WandbRunManager:
         payload["train/global_step"] = int(global_step)
         self._run.log(payload, step=int(global_step))
 
-    def log_memorization(self, pairs: Sequence[Mapping[str, object]], global_step: int) -> None:
+    def log_memorization(self, pairs: Sequence[Mapping[str, object]], global_step: int) -> Mapping[str, object]:
         """Upload the complete four-pair manual-review payload in one W&B step."""
+        if self._settings.mode != "online":
+            raise RuntimeError("Memorization logging requires online W&B mode.")
         materialized = [dict(pair) for pair in pairs]
-        identities = [pair.get("sample_id") for pair in materialized]
-        if (
-            len(materialized) != 4
-            or len(set(identities)) != 4
-            or not all(isinstance(identity, str) and identity for identity in identities)
-        ):
-            raise ValueError("Memorization logging requires exactly four distinct sample identities.")
+        pair_payload = memorization_pair_payload(
+            materialized,
+            global_step=global_step,
+            run_id=self.run_id,
+            mode=self._settings.mode,
+        )
         rows: list[list[object]] = []
         reference_audio: list[object] = []
         generated_audio: list[object] = []
@@ -283,6 +335,16 @@ class WandbRunManager:
                 "memorization/generated_audio": generated_audio,
             },
             step=int(global_step),
+        )
+        return MappingProxyType(
+            {
+                "run_id": self.run_id,
+                "mode": self._settings.mode,
+                "global_step": int(global_step),
+                "pair_count": 4,
+                "pair_payload": pair_payload,
+                "pair_payload_fingerprint": fingerprint(pair_payload),
+            }
         )
 
     def log_validation(

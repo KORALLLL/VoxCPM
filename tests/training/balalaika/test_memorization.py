@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 import torch
 
-from voxcpm.training.balalaika.artifacts import sha256_file
+from voxcpm.training.balalaika.artifacts import fingerprint, sha256_file
 from voxcpm.training.balalaika.memorization import (
     ApprovalMismatch,
     MemorizationError,
@@ -19,7 +19,7 @@ from voxcpm.training.balalaika.memorization import (
     run_memorization,
     verify_approval,
 )
-from voxcpm.training.balalaika.tracking import WandbRunManager
+from voxcpm.training.balalaika.tracking import WandbRunManager, memorization_pair_payload
 from voxcpm.training.balalaika.trainer import BalalaikaTrainer
 
 
@@ -51,16 +51,19 @@ class TinyModel(torch.nn.Module):
 
 
 class FakeRuntime:
-    rank = 0
-    world_size = 1
     device = torch.device("cpu")
     sync_gradients = True
 
-    def __init__(self, events):
+    def __init__(self, events, *, rank=0, world_size=1, gathered_values=(), on_gather=None):
         self.events = events
+        self.rank = rank
+        self.world_size = world_size
         self.accelerator = self
         self.backward_calls = 0
         self.skipped_attempts = set()
+        self.gathered_values = list(gathered_values)
+        self.gather_calls = 0
+        self.on_gather = on_gather
 
     @property
     def optimizer_step_was_skipped(self):
@@ -84,6 +87,11 @@ class FakeRuntime:
         return torch.nn.utils.clip_grad_norm_(tuple(parameters), max_norm)
 
     def gather(self, value):
+        self.gather_calls += 1
+        if self.on_gather is not None:
+            self.on_gather(self.gather_calls)
+        if self.gathered_values:
+            return torch.tensor(self.gathered_values.pop(0), dtype=value.dtype, device=value.device)
         return value
 
     def barrier(self):
@@ -133,15 +141,33 @@ class FakeCheckpointManager:
 class FakeRunManager:
     def __init__(self):
         self.run_id = "wandb123"
+        self._settings = SimpleNamespace(mode="online", group=None)
         self.losses = []
         self.pairs = []
         self.finish_calls = 0
+        self.fail_train = False
 
     def log_train(self, metrics, global_step):
+        if self.fail_train:
+            raise RuntimeError("injected train log failure")
         self.losses.append((dict(metrics), global_step))
 
     def log_memorization(self, pairs, global_step):
         self.pairs.append((list(pairs), global_step))
+        payload = memorization_pair_payload(
+            pairs,
+            global_step=global_step,
+            run_id=self.run_id,
+            mode="online",
+        )
+        return {
+            "run_id": self.run_id,
+            "mode": "online",
+            "global_step": global_step,
+            "pair_count": 4,
+            "pair_payload": payload,
+            "pair_payload_fingerprint": fingerprint(payload),
+        }
 
     def finish(self):
         self.finish_calls += 1
@@ -229,7 +255,7 @@ def mem_fixture(tmp_path, monkeypatch):
             max_grad_norm=1.0,
             loss_weights={"loss/diff": 1.0, "loss/stop": 1.0},
         ),
-        wandb=SimpleNamespace(project="test", mode="disabled"),
+        wandb=SimpleNamespace(project="test", mode="online"),
     )
     runtime = FakeRuntime(events)
     run_manager = FakeRunManager()
@@ -281,12 +307,28 @@ def test_memorization_repeats_only_four_selected_items_and_stops(mem_fixture):
     result = run_memorization(mem_fixture.config, mem_fixture.runtime)
 
     assert set(result.seen_sample_ids) == set(mem_fixture.selected_ids)
-    assert result.seen_sample_ids == tuple(mem_fixture.selected_ids * 2)
+    assert len(result.seen_sample_ids) == 8
     assert len(result.reference_audio) == len(result.generated_audio) == 4
     assert result.large_training_started is False
     assert len(mem_fixture.run_manager.losses) == 8
     assert mem_fixture.run_manager.finish_calls == 1
     assert result.result_path.name == "memorization-result.json"
+    assert set(result.attempted_sample_ids) == set(mem_fixture.selected_ids)
+    assert set(result.contributing_sample_ids) == set(mem_fixture.selected_ids)
+
+
+def test_memorization_batch_order_is_reproducibly_shuffled_by_seed(mem_fixture):
+    first = run_memorization(mem_fixture.config, mem_fixture.runtime)
+    mem_fixture.config.output_dir = mem_fixture.config.output_dir.parent / "same-seed-run"
+    second = run_memorization(mem_fixture.config, mem_fixture.runtime)
+    mem_fixture.config.output_dir = mem_fixture.config.output_dir.parent / "different-seed-run"
+    mem_fixture.config.memorization.seed += 1
+    third = run_memorization(mem_fixture.config, mem_fixture.runtime)
+
+    sequential = tuple(mem_fixture.selected_ids * 2)
+    assert first.attempted_sample_ids == second.attempted_sample_ids
+    assert first.attempted_sample_ids != sequential
+    assert third.attempted_sample_ids != first.attempted_sample_ids
 
 
 def test_memorization_replays_repeat_stream_after_skipped_optimizer_attempt(mem_fixture):
@@ -375,6 +417,16 @@ def test_memorization_requires_four_distinct_published_samples(mem_fixture):
     assert mem_fixture.models == []
 
 
+def test_memorization_rejects_geometry_that_cannot_cover_all_four_before_setup(mem_fixture):
+    mem_fixture.config.memorization.updates = 3
+
+    with pytest.raises(MemorizationError, match="geometry.*four selected"):
+        run_memorization(mem_fixture.config, mem_fixture.runtime)
+
+    assert mem_fixture.models == []
+    assert mem_fixture.run_manager.losses == []
+
+
 def test_worker_rank_uses_shared_wandb_identity_and_never_generates_or_logs(mem_fixture, monkeypatch):
     from voxcpm.training.balalaika import memorization as module
 
@@ -395,25 +447,60 @@ def test_worker_rank_uses_shared_wandb_identity_and_never_generates_or_logs(mem_
         encoding="utf-8",
     )
     mem_fixture.runtime.rank = 1
-    barrier_calls = 0
+    mem_fixture.runtime.world_size = 2
 
-    def barrier():
-        nonlocal barrier_calls
-        barrier_calls += 1
-        if barrier_calls != 2:
+    def publish_main_result(gather_call):
+        if gather_call != 16:
             return
         generated = []
         for number in range(4):
             path = result_dir / "generated" / f"item-{number:02d}.wav"
             _write_wav(path)
             generated.append({"path": str(path), "sha256": sha256_file(path)})
+        pairs = [
+            {
+                "sample_id": sample_id,
+                "text": sample["text"],
+                "asr_hypothesis": "worker-shared",
+                "reference_audio": sample["wav_path"],
+                "generated_audio": generated[number]["path"],
+            }
+            for number, (sample_id, sample) in enumerate(
+                zip(mem_fixture.selected_ids, mem_fixture.samples, strict=True)
+            )
+        ]
+        pair_payload = memorization_pair_payload(
+            pairs,
+            global_step=8,
+            run_id="wandb123",
+            mode="online",
+        )
         completion = result_dir / "wandb-complete.json"
         completion.write_text(
-            json.dumps({"version": 1, "status": "complete", "job_type": "memorization", "run_id": "wandb123"}),
+            json.dumps(
+                {
+                    "version": 1,
+                    "status": "complete",
+                    "job_type": "memorization",
+                    "run_id": "wandb123",
+                    "mode": "online",
+                    "global_step": 8,
+                    "pair_count": 4,
+                    "pair_payload_fingerprint": fingerprint(pair_payload),
+                    "client_log_returned": True,
+                    "remote_receipt_verified": False,
+                    "verification_scope": (
+                        "local W&B client log and finish calls returned; "
+                        "W&B provides no server-side receipt in this workflow"
+                    ),
+                }
+            ),
             encoding="utf-8",
         )
         selection = mem_fixture.config.selection_dir / "memorization.json"
         references = [{"path": sample["wav_path"], "sha256": sample["wav_sha256"]} for sample in mem_fixture.samples]
+        audit_path = result_dir / "batch-audit" / "rank-00001.json"
+        audit = json.loads(audit_path.read_text(encoding="utf-8"))
         (result_dir / "memorization-result.json").write_text(
             json.dumps(
                 {
@@ -421,7 +508,11 @@ def test_worker_rank_uses_shared_wandb_identity_and_never_generates_or_logs(mem_
                     "status": "complete",
                     "large_training_started": False,
                     "updates": 8,
-                    "seen_sample_ids": mem_fixture.selected_ids * 2,
+                    "seen_sample_ids": audit["attempted_sample_ids"],
+                    "attempted_sample_ids": audit["attempted_sample_ids"],
+                    "contributing_sample_ids": audit["contributing_sample_ids"],
+                    "batch_audits": [{"path": str(audit_path), "sha256": sha256_file(audit_path)}],
+                    "wandb_pair_payload": pair_payload,
                     "reference_audio": references,
                     "generated_audio": generated,
                     "diagnostics": ["worker-shared"] * 4,
@@ -443,14 +534,152 @@ def test_worker_rank_uses_shared_wandb_identity_and_never_generates_or_logs(mem_
             encoding="utf-8",
         )
 
-    mem_fixture.runtime.barrier = barrier
+    mem_fixture.runtime.on_gather = publish_main_result
     monkeypatch.setattr(module, "create_run_manager", lambda **kwargs: WorkerRunManager())
 
     result = run_memorization(mem_fixture.config, mem_fixture.runtime)
 
     assert result.wandb_run_id == "wandb123"
     assert [event for event in mem_fixture.events if event[0] == "generate"] == []
-    assert barrier_calls == 2
+    assert mem_fixture.runtime.gather_calls == 16
+
+
+def test_main_rank_train_log_failure_is_published_and_coordinated(mem_fixture):
+    mem_fixture.runtime.world_size = 2
+    mem_fixture.run_manager.fail_train = True
+
+    with pytest.raises(
+        MemorizationError,
+        match="memorization train-log failed on rank zero: RuntimeError: injected train log failure",
+    ):
+        run_memorization(mem_fixture.config, mem_fixture.runtime)
+
+    failure = json.loads((mem_fixture.config.output_dir / "memorization" / "memorization-failed.json").read_text())
+    assert failure == {
+        "version": 1,
+        "status": "failed",
+        "phase": "train-log",
+        "error": {"type": "RuntimeError", "message": "injected train log failure"},
+    }
+    assert mem_fixture.runtime.gather_calls == 3
+
+
+def test_worker_reconstructs_main_train_log_failure_without_final_barrier(mem_fixture, monkeypatch):
+    from voxcpm.training.balalaika import memorization as module
+
+    result_dir = mem_fixture.config.output_dir / "memorization"
+    result_dir.mkdir(parents=True)
+    (result_dir / "wandb-run.json").write_text(
+        json.dumps({"version": 1, "job_type": "memorization", "run_id": "wandb123", "config_fingerprint": "cfg"}),
+        encoding="utf-8",
+    )
+    (result_dir / "memorization-failed.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "status": "failed",
+                "phase": "train-log",
+                "error": {"type": "RuntimeError", "message": "injected train log failure"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    runtime = FakeRuntime(mem_fixture.events, rank=1, world_size=2, gathered_values=([1, 1], [1, 1], [0, 1]))
+    mem_fixture.runtime = runtime
+    monkeypatch.setattr(module, "create_run_manager", lambda **kwargs: SimpleNamespace(log_train=lambda *args: None))
+
+    with pytest.raises(
+        MemorizationError,
+        match="memorization train-log failed on rank zero: RuntimeError: injected train log failure",
+    ):
+        run_memorization(mem_fixture.config, runtime)
+
+    assert runtime.gather_calls == 3
+    assert [event for event in mem_fixture.events if event[0] == "generate"] == []
+
+
+def test_main_result_failure_is_published_and_coordinated(mem_fixture, monkeypatch):
+    from voxcpm.training.balalaika import memorization as module
+
+    write_json = module.atomic_json
+    result_path = (mem_fixture.config.output_dir / "memorization" / "memorization-result.json").resolve()
+
+    def fail_result(path, value):
+        if Path(path).resolve() == result_path:
+            raise OSError("injected result publication failure")
+        return write_json(path, value)
+
+    monkeypatch.setattr(module, "atomic_json", fail_result)
+
+    result_failure = (
+        "memorization result-publication failed on rank zero: " "OSError: injected result publication failure"
+    )
+    with pytest.raises(
+        MemorizationError,
+        match=result_failure,
+    ):
+        run_memorization(mem_fixture.config, mem_fixture.runtime)
+
+    failure_path = result_path.parent / "memorization-failed.json"
+    failure = json.loads(failure_path.read_text())
+    assert failure["phase"] == "result-publication"
+    assert failure["error"] == {
+        "type": "OSError",
+        "message": "injected result publication failure",
+    }
+
+
+def test_worker_reconstructs_main_result_failure(mem_fixture, monkeypatch):
+    from voxcpm.training.balalaika import memorization as module
+
+    result_dir = mem_fixture.config.output_dir / "memorization"
+    result_dir.mkdir(parents=True)
+    (result_dir / "wandb-run.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "job_type": "memorization",
+                "run_id": "wandb123",
+                "config_fingerprint": "cfg",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (result_dir / "memorization-failed.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "status": "failed",
+                "phase": "result-publication",
+                "error": {
+                    "type": "OSError",
+                    "message": "injected result publication failure",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    successes = [[1, 1]] * 15
+    runtime = FakeRuntime(
+        mem_fixture.events,
+        rank=1,
+        world_size=2,
+        gathered_values=(*successes, [0, 1]),
+    )
+    mem_fixture.runtime = runtime
+    worker = SimpleNamespace(log_train=lambda *args: None)
+    monkeypatch.setattr(module, "create_run_manager", lambda **kwargs: worker)
+
+    result_failure = (
+        "memorization result-publication failed on rank zero: " "OSError: injected result publication failure"
+    )
+    with pytest.raises(
+        MemorizationError,
+        match=result_failure,
+    ):
+        run_memorization(mem_fixture.config, runtime)
+
+    assert runtime.gather_calls == 16
 
 
 @pytest.fixture
@@ -469,7 +698,15 @@ def test_approval_is_bound_to_checkpoint_wandb_and_approver(mem_result):
         verify_approval(path, tampered)
 
 
-@pytest.mark.parametrize("field", ["base_revision", "data_fingerprint", "selection_fingerprint", "lora_fingerprint"])
+_STAGE_IDENTITY_FIELDS = [
+    "base_revision",
+    "data_fingerprint",
+    "selection_fingerprint",
+    "lora_fingerprint",
+]
+
+
+@pytest.mark.parametrize("field", _STAGE_IDENTITY_FIELDS)
 def test_approval_rejects_another_stage1_identity(mem_result, field):
     path = approve_memorization(mem_result.dir, "wandb123", "operator")
     expected = {**mem_result.fingerprints, field: "other"}
@@ -478,30 +715,32 @@ def test_approval_rejects_another_stage1_identity(mem_result, field):
         verify_approval(path, expected)
 
 
-@pytest.mark.parametrize("field", ["base_revision", "data_fingerprint", "selection_fingerprint", "lora_fingerprint"])
-def test_stage1_real_approval_verifier_rejects_another_identity_before_model_setup(mem_result, field):
-    approval_path = approve_memorization(mem_result.dir, "wandb123", "operator")
+@pytest.mark.parametrize("field", _STAGE_IDENTITY_FIELDS)
+def test_stage1_rejects_another_identity_before_model_setup(mem_result, field):
+    result_dir = mem_result.dir
+    approval_path = approve_memorization(result_dir, "wandb123", "operator")
     model_calls = []
+    result_fingerprints = mem_result.fingerprints
     current = {
-        "base_revision": mem_result.fingerprints["base_revision"],
+        "base_revision": result_fingerprints["base_revision"],
         "evaluator_revision": "asr-sha",
-        "data_fingerprint": mem_result.fingerprints["data_fingerprint"],
-        "selection_fingerprint": mem_result.fingerprints["selection_fingerprint"],
-        "lora_fingerprint": mem_result.fingerprints["lora_fingerprint"],
+        "data_fingerprint": result_fingerprints["data_fingerprint"],
+        "selection_fingerprint": result_fingerprints["selection_fingerprint"],
+        "lora_fingerprint": result_fingerprints["lora_fingerprint"],
         "optimization_fingerprint": "stage-optimization-sha",
         "wandb_run_id": "stage1-run",
         "wandb_group": None,
     }
     current[field] = "other"
-    approval_expected = {
-        key: value
-        for key, value in mem_result.fingerprints.items()
-        if key not in {"base_revision", "data_fingerprint", "selection_fingerprint", "lora_fingerprint"}
-    }
+    stage_identity_fields = set(_STAGE_IDENTITY_FIELDS)
+    approval_expected = dict(mem_result.fingerprints)
+    for key in stage_identity_fields:
+        approval_expected.pop(key)
 
     def model_builder(*args, **kwargs):
         model_calls.append((args, kwargs))
-        raise AssertionError("model setup must not run before approval verification")
+        message = "model setup must not run before approval verification"
+        raise AssertionError(message)
 
     trainer = BalalaikaTrainer(
         SimpleNamespace(
@@ -525,10 +764,11 @@ def test_stage1_real_approval_verifier_rejects_another_identity_before_model_set
     assert model_calls == []
 
 
-def test_approval_verification_requires_the_complete_expected_identity(mem_result):
+def test_approval_requires_complete_expected_identity(mem_result):
     path = approve_memorization(mem_result.dir, "wandb123", "operator")
 
-    with pytest.raises(ApprovalMismatch, match="expected fingerprints.*incomplete"):
+    incomplete_error = "expected fingerprints.*incomplete"
+    with pytest.raises(ApprovalMismatch, match=incomplete_error):
         verify_approval(path, {})
 
 
@@ -539,7 +779,45 @@ def test_missing_wandb_completion_cannot_be_approved(mem_result):
         approve_memorization(mem_result.dir, "wandb123", "operator")
 
 
-def test_approval_rejects_wrong_wandb_identity_and_tampered_artifact(mem_result):
+@pytest.mark.parametrize("mode", ["offline", "disabled"])
+def test_approval_rejects_non_online_wandb_completion(mem_result, mode):
+    completion_path = mem_result.wandb_completion_path
+    completion = json.loads(completion_path.read_text(encoding="utf-8"))
+    completion["mode"] = mode
+    completion_path.write_text(json.dumps(completion), encoding="utf-8")
+    result = json.loads(mem_result.result_path.read_text(encoding="utf-8"))
+    result["fingerprints"]["wandb_completion"] = sha256_file(completion_path)
+    mem_result.result_path.write_text(json.dumps(result), encoding="utf-8")
+
+    with pytest.raises(ApprovalMismatch, match="online W&B"):
+        approve_memorization(mem_result.dir, "wandb123", "operator")
+
+
+def test_approval_rejects_unverifiable_wandb_pair_payload(mem_result):
+    completion_path = mem_result.wandb_completion_path
+    completion = json.loads(completion_path.read_text(encoding="utf-8"))
+    completion["pair_payload_fingerprint"] = "0" * 64
+    completion_path.write_text(json.dumps(completion), encoding="utf-8")
+    result = json.loads(mem_result.result_path.read_text(encoding="utf-8"))
+    result["fingerprints"]["wandb_completion"] = sha256_file(completion_path)
+    mem_result.result_path.write_text(json.dumps(result), encoding="utf-8")
+
+    with pytest.raises(ApprovalMismatch, match="four-pair payload"):
+        approve_memorization(mem_result.dir, "wandb123", "operator")
+
+
+def test_approval_rejects_tampered_observed_identity_coverage(mem_result):
+    value = json.loads(mem_result.result_path.read_text(encoding="utf-8"))
+    value["contributing_sample_ids"] = [value["contributing_sample_ids"][0]]
+    value["seen_sample_ids"] = list(value["contributing_sample_ids"])
+    mem_result.result_path.write_text(json.dumps(value), encoding="utf-8")
+
+    coverage_error = "observed contribution coverage.*four selected"
+    with pytest.raises(ApprovalMismatch, match=coverage_error):
+        approve_memorization(mem_result.dir, "wandb123", "operator")
+
+
+def test_approval_rejects_wrong_run_and_tampered_artifact(mem_result):
     with pytest.raises(ApprovalMismatch, match="W&B run"):
         approve_memorization(mem_result.dir, "another-run", "operator")
 
@@ -559,7 +837,7 @@ def test_approval_record_integrity_binds_approver(mem_result):
         verify_approval(path, mem_result.fingerprints)
 
 
-def test_wandb_memorization_logging_uploads_exactly_four_complete_pairs(tmp_path):
+def test_wandb_uploads_exactly_four_complete_memorization_pairs(tmp_path):
     class Audio:
         def __init__(self, path, *, caption):
             self.path = path
@@ -583,11 +861,19 @@ def test_wandb_memorization_logging_uploads_exactly_four_complete_pairs(tmp_path
             return None
 
     run = Run()
-    wandb = SimpleNamespace(Audio=Audio, Table=Table, init=lambda **kwargs: run)
+
+    def initialize(**kwargs):
+        return run
+
+    wandb = SimpleNamespace(Audio=Audio, Table=Table, init=initialize)
     manager = WandbRunManager.start(
         "memorization",
         tmp_path / "run-state.json",
-        {"output_dir": tmp_path, "mode": "disabled", "config_fingerprint": "config-sha"},
+        {
+            "output_dir": tmp_path,
+            "mode": "online",
+            "config_fingerprint": "config-sha",
+        },
         wandb_module=wandb,
     )
     pairs = []
@@ -606,7 +892,7 @@ def test_wandb_memorization_logging_uploads_exactly_four_complete_pairs(tmp_path
             }
         )
 
-    manager.log_memorization(pairs, global_step=8)
+    receipt = manager.log_memorization(pairs, global_step=8)
 
     payload, step = run.logged[0]
     assert step == 8
@@ -620,3 +906,30 @@ def test_wandb_memorization_logging_uploads_exactly_four_complete_pairs(tmp_path
     assert len(payload["memorization/pairs"].data) == 4
     assert len(payload["memorization/reference_audio"]) == 4
     assert len(payload["memorization/generated_audio"]) == 4
+    assert receipt["run_id"] == manager.run_id
+    assert receipt["mode"] == "online"
+    assert receipt["global_step"] == 8
+    assert receipt["pair_count"] == 4
+    assert len(receipt["pair_payload_fingerprint"]) == 64
+
+
+@pytest.mark.parametrize("mode", ["offline", "disabled"])
+def test_wandb_memorization_rejects_non_online_modes(tmp_path, mode):
+    def no_op(*args, **kwargs):
+        return None
+
+    run = SimpleNamespace(log=no_op, finish=no_op)
+    wandb = SimpleNamespace(init=lambda **kwargs: run)
+    manager = WandbRunManager.start(
+        "memorization",
+        tmp_path / f"{mode}-state.json",
+        {
+            "output_dir": tmp_path,
+            "mode": mode,
+            "config_fingerprint": "config-sha",
+        },
+        wandb_module=wandb,
+    )
+
+    with pytest.raises(RuntimeError, match="online W&B"):
+        manager.log_memorization([], global_step=8)

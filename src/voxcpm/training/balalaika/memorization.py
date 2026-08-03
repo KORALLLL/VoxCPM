@@ -16,7 +16,7 @@ import numpy as np
 import soundfile as sf
 import torch
 import torchaudio
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, RandomSampler
 
 from voxcpm.training.data import VoxCPMCollator
 
@@ -25,7 +25,7 @@ from .asr import GigaAMRNNT
 from .checkpoint import CheckpointManager
 from .schedule import EpochGeometry, TrainingProgress
 from .selection import SelectedSample
-from .tracking import create_run_manager
+from .tracking import create_run_manager, memorization_pair_payload
 from .trainer import (
     _accelerator,
     _default_batch_processor_factory,
@@ -80,6 +80,8 @@ class MemorizationResult:
     result_path: Path
     status: str
     seen_sample_ids: tuple[str, ...]
+    attempted_sample_ids: tuple[str, ...]
+    contributing_sample_ids: tuple[str, ...]
     reference_audio: tuple[Path, ...]
     generated_audio: tuple[Path, ...]
     diagnostics: tuple[str, ...]
@@ -117,18 +119,36 @@ def run_memorization(config: Any, runtime: Any) -> MemorizationResult:
     """Overfit the published four-item selection, log diagnostics, and stop."""
     settings = _settings(config, runtime)
     selection_path, selection_fingerprint, samples = _load_selection(config)
+    global_samples = settings["updates"] * settings["accumulation"] * settings["batch_size"] * runtime.world_size
+    if global_samples < len(samples):
+        raise MemorizationError("memorization geometry cannot cover all four selected identities")
     result_dir = Path(config.output_dir).resolve() / "memorization"
     result_path = result_dir / "memorization-result.json"
     if result_path.exists():
         raise MemorizationError(f"completed memorization result already exists: {result_path}")
 
-    run_manager = create_run_manager(
-        is_main_process=runtime.rank == 0,
-        config=config,
-        job_type="memorization",
-        run_state_path=result_dir / "wandb-run.json",
+    run_manager_holder: list[Any] = []
+
+    def start_tracking() -> None:
+        run_manager_holder.append(
+            create_run_manager(
+                is_main_process=True,
+                config=config,
+                job_type="memorization",
+                run_state_path=result_dir / "wandb-run.json",
+            )
+        )
+
+    _rank_zero_phase(runtime, result_dir, "tracking-start", start_tracking)
+    run_manager = (
+        run_manager_holder[0] if runtime.rank == 0 else create_run_manager(is_main_process=False, config=config)
     )
-    runtime.barrier()
+    _rank_zero_phase(
+        runtime,
+        result_dir,
+        "tracking-mode",
+        lambda: _require_online_tracking(run_manager),
+    )
     run_id = getattr(run_manager, "run_id", None)
     if not isinstance(run_id, str) or not run_id:
         run_id = _wandb_run_id(result_dir / "wandb-run.json")
@@ -146,12 +166,13 @@ def run_memorization(config: Any, runtime: Any) -> MemorizationResult:
         weight_decay=settings["weight_decay"],
     )
     scheduler = _default_scheduler_factory(optimizer, warmup_steps=0, total_steps=settings["updates"])
-    global_samples = settings["updates"] * settings["accumulation"] * settings["batch_size"] * runtime.world_size
     dataset = _RepeatDataset(samples, global_samples, tokenizer)
+    sampler_generator = torch.Generator()
+    sampler_generator.manual_seed(settings["seed"])
     loader = DataLoader(
         dataset,
         batch_size=settings["batch_size"],
-        shuffle=False,
+        sampler=RandomSampler(dataset, generator=sampler_generator),
         drop_last=True,
         collate_fn=VoxCPMCollator(),
     )
@@ -170,6 +191,9 @@ def run_memorization(config: Any, runtime: Any) -> MemorizationResult:
     )
     progress = TrainingProgress(stage="stage1", sampler_seed=settings["seed"])
     losses: list[float] = []
+    attempted_sample_ids: list[str] = []
+    contributing_sample_ids: list[str] = []
+    pending_contribution_ids: list[str] = []
     accumulation_cursor = 0
     iterator = iter(loader)
     while progress.optimizer_step < settings["updates"]:
@@ -182,6 +206,9 @@ def run_memorization(config: Any, runtime: Any) -> MemorizationResult:
             except StopIteration as error:
                 raise MemorizationError("prepared memorization loader is empty") from error
         with runtime.accumulate(model):
+            batch_sample_ids = _batch_sample_ids(batch, samples)
+            attempted_sample_ids.extend(batch_sample_ids)
+            pending_contribution_ids.extend(batch_sample_ids)
             processed = processor(batch)
             outputs = _forward(model, processed, progress.optimizer_step / settings["updates"])
             loss = _weighted_loss(outputs, settings["loss_weights"])
@@ -202,13 +229,56 @@ def run_memorization(config: Any, runtime: Any) -> MemorizationResult:
             optimizer.zero_grad(set_to_none=True)
             accumulation_cursor = 0
             if skipped:
+                pending_contribution_ids.clear()
                 continue
+            contributing_sample_ids.extend(pending_contribution_ids)
+            pending_contribution_ids.clear()
             progress.complete_optimizer_step(geometry)
             loss_value = float(loss.detach().cpu())
             losses.append(loss_value)
-            run_manager.log_train({"memorization/loss": loss_value}, progress.global_step)
-    if accumulation_cursor != 0:
+            _rank_zero_phase(
+                runtime,
+                result_dir,
+                "train-log",
+                lambda: run_manager.log_train({"memorization/loss": loss_value}, progress.global_step),
+            )
+    if accumulation_cursor != 0 or pending_contribution_ids:
         raise MemorizationError("memorization loader ended before the configured updates completed")
+
+    audit_dir = result_dir / "batch-audit"
+    audit_path = audit_dir / f"rank-{runtime.rank:05d}.json"
+
+    def write_batch_audit() -> None:
+        atomic_json(
+            audit_path,
+            {
+                "version": 1,
+                "rank": runtime.rank,
+                "selection_fingerprint": selection_fingerprint,
+                "attempted_sample_ids": attempted_sample_ids,
+                "contributing_sample_ids": contributing_sample_ids,
+                "completed_optimizer_steps": progress.optimizer_step,
+            },
+        )
+
+    _all_rank_phase(runtime, result_dir, "batch-audit", write_batch_audit)
+    combined_attempted: list[str] = []
+    combined_contributing: list[str] = []
+    audit_paths: list[Path] = []
+
+    def validate_coverage() -> None:
+        audit_paths.extend(audit_dir / f"rank-{rank:05d}.json" for rank in range(runtime.world_size))
+        for path in audit_paths:
+            audit = _json_mapping(path, "memorization batch audit")
+            if audit.get("selection_fingerprint") != selection_fingerprint:
+                raise MemorizationError(f"batch audit selection identity does not match: {path}")
+            combined_attempted.extend(_identity_sequence(audit.get("attempted_sample_ids"), "attempted samples"))
+            combined_contributing.extend(
+                _identity_sequence(audit.get("contributing_sample_ids"), "contributing samples")
+            )
+        _require_exact_coverage(samples, combined_attempted, combined_contributing, MemorizationError)
+
+    _rank_zero_phase(runtime, result_dir, "coverage-validation", validate_coverage)
 
     checkpoint_manager = CheckpointManager(result_dir / "checkpoints")
     checkpoint = checkpoint_manager.save_recovery(
@@ -219,9 +289,12 @@ def run_memorization(config: Any, runtime: Any) -> MemorizationResult:
         name="memorization-final",
     )
     checkpoint_fingerprint = _checkpoint_fingerprint(checkpoint)
-    if runtime.rank == 0:
+    generated_audio: list[Path] = []
+    diagnostics: list[str] = []
+    pairs: list[dict[str, object]] = []
+
+    def generate_and_diagnose() -> None:
         generated_dir = result_dir / "generated"
-        generated_audio: list[Path] = []
         target_model = runtime.unwrap(model)
         model_was_training = target_model.training
         audio_vae_was_training = audio_vae.training
@@ -244,8 +317,8 @@ def run_memorization(config: Any, runtime: Any) -> MemorizationResult:
             target_model.train(model_was_training)
             audio_vae.train(audio_vae_was_training)
 
-        diagnostics = _diagnose_generated(config, runtime, generated_audio)
-        pairs = [
+        diagnostics.extend(_diagnose_generated(config, runtime, generated_audio))
+        pairs.extend(
             {
                 "sample_id": sample.source_relative_path,
                 "text": sample.text,
@@ -254,15 +327,45 @@ def run_memorization(config: Any, runtime: Any) -> MemorizationResult:
                 "asr_hypothesis": hypothesis,
             }
             for sample, generated_path, hypothesis in zip(samples, generated_audio, diagnostics, strict=True)
-        ]
-        run_manager.log_memorization(pairs, global_step=progress.global_step)
-        run_manager.finish()
+        )
 
+    _rank_zero_phase(runtime, result_dir, "generation", generate_and_diagnose)
+    upload_receipts: list[dict[str, Any]] = []
+
+    def upload_pairs() -> None:
+        receipt = run_manager.log_memorization(pairs, global_step=progress.global_step)
+        upload_receipts.append(_validated_upload_receipt(receipt, pairs, progress.global_step, run_id))
+
+    _rank_zero_phase(runtime, result_dir, "pair-upload", upload_pairs)
+
+    def finish_tracking() -> None:
+        run_manager.finish()
+        receipt = upload_receipts[0]
         wandb_completion_path = result_dir / "wandb-complete.json"
         atomic_json(
             wandb_completion_path,
-            {"version": 1, "status": "complete", "job_type": "memorization", "run_id": run_id},
+            {
+                "version": 1,
+                "status": "complete",
+                "job_type": "memorization",
+                "run_id": run_id,
+                "mode": "online",
+                "global_step": receipt["global_step"],
+                "pair_count": receipt["pair_count"],
+                "pair_payload_fingerprint": receipt["pair_payload_fingerprint"],
+                "client_log_returned": True,
+                "remote_receipt_verified": False,
+                "verification_scope": (
+                    "local W&B client log and finish calls returned; "
+                    "W&B provides no server-side receipt in this workflow"
+                ),
+            },
         )
+
+    _rank_zero_phase(runtime, result_dir, "wandb-finish", finish_tracking)
+
+    def publish_result() -> None:
+        wandb_completion_path = result_dir / "wandb-complete.json"
         reference_audio = tuple(sample.wav_path.resolve() for sample in samples)
         generated_tuple = tuple(path.resolve() for path in generated_audio)
         core_fingerprints = {
@@ -279,7 +382,11 @@ def run_memorization(config: Any, runtime: Any) -> MemorizationResult:
             "status": "complete",
             "large_training_started": False,
             "updates": settings["updates"],
-            "seen_sample_ids": [samples[index % 4].source_relative_path for index in range(global_samples)],
+            "seen_sample_ids": combined_attempted,
+            "attempted_sample_ids": combined_attempted,
+            "contributing_sample_ids": combined_contributing,
+            "batch_audits": [_artifact_value(path) for path in audit_paths],
+            "wandb_pair_payload": upload_receipts[0]["pair_payload"],
             "reference_audio": [_artifact_value(path) for path in reference_audio],
             "generated_audio": [_artifact_value(path) for path in generated_tuple],
             "diagnostics": diagnostics,
@@ -290,7 +397,8 @@ def run_memorization(config: Any, runtime: Any) -> MemorizationResult:
             "fingerprints": core_fingerprints,
         }
         atomic_json(result_path, result_value)
-    runtime.barrier()
+
+    _rank_zero_phase(runtime, result_dir, "result-publication", publish_result)
     return _load_result(result_path)
 
 
@@ -305,6 +413,7 @@ def approve_memorization(result_dir: str | Path, wandb_run_id: str, approver: st
     result = _json_mapping(result_path, "memorization result")
     if result.get("status") != "complete" or result.get("large_training_started") is not False:
         raise ApprovalMismatch("memorization result is not a completed stopped diagnostic run")
+    _validate_result_coverage(result)
     fingerprints = _string_mapping(result.get("fingerprints"), "result fingerprints")
     if fingerprints.get("wandb_run_id") != wandb_run_id:
         raise ApprovalMismatch("W&B run identity does not match the completed memorization result")
@@ -312,6 +421,7 @@ def approve_memorization(result_dir: str | Path, wandb_run_id: str, approver: st
     completion = _json_mapping(completion_path, "W&B completion")
     if completion.get("status") != "complete" or completion.get("run_id") != wandb_run_id:
         raise ApprovalMismatch("W&B completion does not match the requested run")
+    _validate_wandb_evidence(result, completion, wandb_run_id)
     if sha256_file(completion_path) != fingerprints.get("wandb_completion"):
         raise ApprovalMismatch("W&B completion artifact hash does not match the result")
 
@@ -405,6 +515,48 @@ def _settings(config: Any, runtime: Any) -> dict[str, Any]:
     if settings["accumulation"] != getattr(runtime, "accumulation", settings["accumulation"]):
         raise MemorizationError("runtime and memorization accumulation must match")
     return settings
+
+
+def _require_online_tracking(run_manager: Any) -> None:
+    mode = getattr(getattr(run_manager, "_settings", None), "mode", None)
+    if mode != "online":
+        raise MemorizationError("memorization approval requires online W&B tracking")
+
+
+def _validated_upload_receipt(
+    receipt: Any,
+    pairs: Sequence[Mapping[str, object]],
+    global_step: int,
+    run_id: str,
+) -> dict[str, Any]:
+    if not isinstance(receipt, Mapping):
+        raise MemorizationError("online W&B pair upload returned no verifiable local receipt")
+    expected_payload = memorization_pair_payload(
+        pairs,
+        global_step=global_step,
+        run_id=run_id,
+        mode="online",
+    )
+    payload = receipt.get("pair_payload")
+    expected_fingerprint = fingerprint(expected_payload)
+    if (
+        not isinstance(payload, Mapping)
+        or dict(payload) != expected_payload
+        or receipt.get("run_id") != run_id
+        or receipt.get("mode") != "online"
+        or receipt.get("global_step") != global_step
+        or receipt.get("pair_count") != 4
+        or receipt.get("pair_payload_fingerprint") != expected_fingerprint
+    ):
+        raise MemorizationError("online W&B receipt does not bind the exact four-pair payload and run")
+    return {
+        "run_id": run_id,
+        "mode": "online",
+        "global_step": global_step,
+        "pair_count": 4,
+        "pair_payload": expected_payload,
+        "pair_payload_fingerprint": expected_fingerprint,
+    }
 
 
 def _load_selection(config: Any) -> tuple[Path, str, tuple[SelectedSample, ...]]:
@@ -531,6 +683,236 @@ def _diagnostic_error(error: Exception) -> str:
     return f"ERROR: {type(error).__name__}: {error}"
 
 
+def _rank_zero_phase(runtime: Any, result_dir: Path, phase: str, operation: Callable[[], None]) -> None:
+    local_error: BaseException | None = None
+    if runtime.rank == 0:
+        try:
+            operation()
+        except BaseException as error:
+            local_error = error
+            try:
+                atomic_json(
+                    result_dir / "memorization-failed.json",
+                    {
+                        "version": 1,
+                        "status": "failed",
+                        "phase": phase,
+                        "error": {"type": type(error).__name__, "message": str(error)},
+                    },
+                )
+            except BaseException:
+                pass
+    status = torch.tensor([0 if local_error is not None else 1], dtype=torch.int8, device=runtime.device)
+    try:
+        gathered = runtime.gather(status).reshape(-1)
+    except BaseException as error:
+        raise MemorizationError(f"memorization {phase} outcome collective failed") from (local_error or error)
+    if bool((gathered == 1).all().item()):
+        return
+    failure = _json_mapping(result_dir / "memorization-failed.json", "memorization failure")
+    error = failure.get("error")
+    if failure.get("status") != "failed" or failure.get("phase") != phase or not isinstance(error, Mapping):
+        raise MemorizationError(f"memorization {phase} failed on rank zero without matching failure evidence")
+    error_type = str(error.get("type", "RuntimeError"))
+    message = str(error.get("message", "memorization phase failed"))
+    raise MemorizationError(f"memorization {phase} failed on rank zero: {error_type}: {message}") from local_error
+
+
+def _all_rank_phase(runtime: Any, result_dir: Path, phase: str, operation: Callable[[], None]) -> None:
+    local_error: BaseException | None = None
+    failure_path = result_dir / f"memorization-failed-rank-{runtime.rank:05d}.json"
+    try:
+        operation()
+    except BaseException as error:
+        local_error = error
+        try:
+            atomic_json(
+                failure_path,
+                {
+                    "version": 1,
+                    "status": "failed",
+                    "phase": phase,
+                    "rank": runtime.rank,
+                    "error": {"type": type(error).__name__, "message": str(error)},
+                },
+            )
+        except BaseException:
+            pass
+    status = torch.tensor([0 if local_error is not None else 1], dtype=torch.int8, device=runtime.device)
+    try:
+        gathered = runtime.gather(status).reshape(-1)
+    except BaseException as error:
+        raise MemorizationError(f"memorization {phase} outcome collective failed") from (local_error or error)
+    failed_ranks = [rank for rank, item in enumerate(gathered.tolist()) if item == 0]
+    if not failed_ranks:
+        return
+    failed_rank = failed_ranks[0]
+    failure = _json_mapping(
+        result_dir / f"memorization-failed-rank-{failed_rank:05d}.json",
+        "memorization rank failure",
+    )
+    error = failure.get("error")
+    if (
+        failure.get("status") != "failed"
+        or failure.get("phase") != phase
+        or failure.get("rank") != failed_rank
+        or not isinstance(error, Mapping)
+    ):
+        raise MemorizationError(f"memorization {phase} failed on rank {failed_rank} without matching evidence")
+    error_type = str(error.get("type", "RuntimeError"))
+    message = str(error.get("message", "memorization phase failed"))
+    raise MemorizationError(
+        f"memorization {phase} failed on rank {failed_rank}: {error_type}: {message}"
+    ) from local_error
+
+
+def _batch_sample_ids(batch: Mapping[str, Any], samples: Sequence[SelectedSample]) -> list[str]:
+    values = batch.get("dataset_ids")
+    if isinstance(values, torch.Tensor):
+        raw_ids = values.detach().cpu().reshape(-1).tolist()
+    elif isinstance(values, Sequence) and not isinstance(values, (str, bytes)):
+        raw_ids = list(values)
+    else:
+        raise MemorizationError("prepared memorization batch has no dataset identity audit")
+    identities: list[str] = []
+    for value in raw_ids:
+        if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value < len(samples):
+            raise MemorizationError("prepared memorization batch has an invalid dataset identity")
+        identities.append(samples[value].source_relative_path)
+    if not identities:
+        raise MemorizationError("prepared memorization batch has an empty dataset identity audit")
+    return identities
+
+
+def _identity_sequence(value: Any, label: str) -> list[str]:
+    if not isinstance(value, list) or not value or not all(isinstance(item, str) and item for item in value):
+        raise ApprovalMismatch(f"{label} must be a non-empty identity sequence")
+    return list(value)
+
+
+def _require_exact_coverage(
+    samples: Sequence[SelectedSample] | Sequence[str],
+    attempted: Sequence[str],
+    contributing: Sequence[str],
+    error_type: type[MemorizationError],
+) -> None:
+    selected = {sample.source_relative_path if isinstance(sample, SelectedSample) else sample for sample in samples}
+    if len(selected) != 4:
+        raise error_type("memorization coverage requires four selected identities")
+    attempted_set = set(attempted)
+    if attempted_set != selected:
+        raise error_type(
+            "observed attempt coverage does not match the four selected identities; "
+            f"missing={sorted(selected - attempted_set)}, unexpected={sorted(attempted_set - selected)}"
+        )
+    contributing_set = set(contributing)
+    if contributing_set != selected:
+        raise error_type(
+            "observed contribution coverage does not match the four selected identities; "
+            f"missing={sorted(selected - contributing_set)}, unexpected={sorted(contributing_set - selected)}"
+        )
+
+
+def _validate_result_coverage(result: Mapping[str, Any]) -> None:
+    selection_path = Path(str(result.get("selection_manifest", "")))
+    selection = _json_mapping(selection_path, "memorization selection")
+    raw_samples = selection.get("memorization")
+    if not isinstance(raw_samples, list):
+        raise ApprovalMismatch("memorization selection has no selected identities")
+    selected: list[str] = []
+    for item in raw_samples:
+        if not isinstance(item, Mapping):
+            raise ApprovalMismatch("memorization selection identity is malformed")
+        identity = item.get("source_relative_path")
+        if not isinstance(identity, str) or not identity:
+            raise ApprovalMismatch("memorization selection identity is malformed")
+        selected.append(identity)
+    attempted = _identity_sequence(result.get("attempted_sample_ids"), "attempted samples")
+    contributing = _identity_sequence(result.get("contributing_sample_ids"), "contributing samples")
+    _require_exact_coverage(selected, attempted, contributing, ApprovalMismatch)
+    seen = _identity_sequence(result.get("seen_sample_ids"), "seen samples")
+    if seen != attempted:
+        raise ApprovalMismatch("seen sample audit does not match actual attempted batches")
+
+    audits = result.get("batch_audits")
+    if not isinstance(audits, list) or not audits:
+        raise ApprovalMismatch("memorization result has no per-rank batch audits")
+    audited_attempted: list[str] = []
+    audited_contributing: list[str] = []
+    for item in audits:
+        if not isinstance(item, Mapping):
+            raise ApprovalMismatch("memorization batch audit artifact is malformed")
+        path = Path(str(item.get("path", "")))
+        expected = item.get("sha256")
+        if not path.is_file() or not isinstance(expected, str) or sha256_file(path) != expected:
+            raise ApprovalMismatch(f"memorization batch audit artifact does not match: {path}")
+        audit = _json_mapping(path, "memorization batch audit")
+        audited_attempted.extend(_identity_sequence(audit.get("attempted_sample_ids"), "attempted samples"))
+        audited_contributing.extend(_identity_sequence(audit.get("contributing_sample_ids"), "contributing samples"))
+    if audited_attempted != attempted or audited_contributing != contributing:
+        raise ApprovalMismatch("memorization result identity coverage does not match its batch audits")
+
+
+def _validate_wandb_evidence(result: Mapping[str, Any], completion: Mapping[str, Any], run_id: str) -> None:
+    if completion.get("mode") != "online":
+        raise ApprovalMismatch("memorization approval requires an online W&B completion")
+    expected_scope = (
+        "local W&B client log and finish calls returned; " "W&B provides no server-side receipt in this workflow"
+    )
+    if (
+        completion.get("job_type") != "memorization"
+        or completion.get("run_id") != run_id
+        or completion.get("pair_count") != 4
+        or completion.get("client_log_returned") is not True
+        or completion.get("remote_receipt_verified") is not False
+        or completion.get("verification_scope") != expected_scope
+    ):
+        raise ApprovalMismatch("online W&B completion evidence is incomplete or unverifiable")
+    payload = result.get("wandb_pair_payload")
+    if not isinstance(payload, Mapping):
+        raise ApprovalMismatch("online W&B completion has no exact four-pair payload binding")
+    raw_pairs = payload.get("pairs")
+    if not isinstance(raw_pairs, list) or len(raw_pairs) != 4:
+        raise ApprovalMismatch("online W&B completion has no exact four-pair payload binding")
+    reconstructed: list[dict[str, object]] = []
+    try:
+        for pair in raw_pairs:
+            if not isinstance(pair, Mapping):
+                raise TypeError("pair must be a mapping")
+            reference = pair.get("reference_audio")
+            generated = pair.get("generated_audio")
+            if not isinstance(reference, Mapping) or not isinstance(generated, Mapping):
+                raise TypeError("pair audio must be a mapping")
+            for artifact in (reference, generated):
+                path = Path(str(artifact.get("path", "")))
+                expected_hash = artifact.get("sha256")
+                if not path.is_file() or not isinstance(expected_hash, str) or sha256_file(path) != expected_hash:
+                    raise ValueError(f"pair audio artifact does not match: {path}")
+            reconstructed.append(
+                {
+                    "sample_id": pair.get("sample_id"),
+                    "text": pair.get("text"),
+                    "asr_hypothesis": pair.get("asr_hypothesis"),
+                    "reference_audio": reference.get("path"),
+                    "generated_audio": generated.get("path"),
+                }
+            )
+        canonical = memorization_pair_payload(
+            reconstructed,
+            global_step=int(completion.get("global_step")),
+            run_id=run_id,
+            mode="online",
+        )
+    except (OSError, TypeError, ValueError, RuntimeError) as error:
+        raise ApprovalMismatch("online W&B four-pair payload is malformed or unverifiable") from error
+    if (
+        dict(payload) != canonical
+        or completion.get("pair_payload_fingerprint") != fingerprint(canonical)
+        or completion.get("global_step") != canonical["global_step"]
+    ):
+        raise ApprovalMismatch("online W&B four-pair payload fingerprint does not match")
+
+
 def _atomic_wav(path: Path, generated: Any, sample_rate: int) -> None:
     if isinstance(generated, torch.Tensor):
         generated = generated.detach().cpu().numpy()
@@ -577,14 +959,15 @@ def _load_result(path: Path) -> MemorizationResult:
     value = _json_mapping(path, "memorization result")
     if value.get("status") != "complete" or value.get("large_training_started") is not False:
         raise MemorizationError("memorization result is not complete")
-    seen = value.get("seen_sample_ids")
+    _validate_result_coverage(value)
+    seen = _identity_sequence(value.get("seen_sample_ids"), "seen samples")
+    attempted = _identity_sequence(value.get("attempted_sample_ids"), "attempted samples")
+    contributing = _identity_sequence(value.get("contributing_sample_ids"), "contributing samples")
     diagnostics = value.get("diagnostics")
     references = value.get("reference_audio")
     generated = value.get("generated_audio")
     if (
-        not isinstance(seen, list)
-        or not all(isinstance(item, str) for item in seen)
-        or not isinstance(diagnostics, list)
+        not isinstance(diagnostics, list)
         or len(diagnostics) != 4
         or not all(isinstance(item, str) for item in diagnostics)
         or not isinstance(references, list)
@@ -598,17 +981,24 @@ def _load_result(path: Path) -> MemorizationResult:
     if len(reference_paths) != 4 or len(generated_paths) != 4:
         raise MemorizationError("memorization result has malformed artifact paths")
     core_fingerprints = _string_mapping(value.get("fingerprints"), "result fingerprints")
+    completion_path = Path(str(value.get("wandb_completion", ""))).resolve()
+    completion = _json_mapping(completion_path, "W&B completion")
+    _validate_wandb_evidence(value, completion, core_fingerprints.get("wandb_run_id", ""))
+    if sha256_file(completion_path) != core_fingerprints.get("wandb_completion"):
+        raise ApprovalMismatch("W&B completion artifact hash does not match the result")
     return MemorizationResult(
         dir=path.parent.resolve(),
         result_path=path.resolve(),
         status="complete",
         seen_sample_ids=tuple(seen),
+        attempted_sample_ids=tuple(attempted),
+        contributing_sample_ids=tuple(contributing),
         reference_audio=reference_paths,
         generated_audio=generated_paths,
         diagnostics=tuple(diagnostics),
         checkpoint=Path(str(value.get("checkpoint", ""))).resolve(),
         wandb_run_id=core_fingerprints["wandb_run_id"],
-        wandb_completion_path=Path(str(value.get("wandb_completion", ""))).resolve(),
+        wandb_completion_path=completion_path,
         fingerprints=MappingProxyType({**core_fingerprints, "result": sha256_file(path)}),
     )
 
@@ -632,6 +1022,17 @@ def _approval_artifacts(result_path: Path, result: Mapping[str, Any]) -> list[di
             if not candidate.is_file() or not isinstance(expected, str) or sha256_file(candidate) != expected:
                 raise ApprovalMismatch(f"result {role} artifact does not match: {candidate}")
             artifacts.append({"role": f"{role}:{number}", "path": str(candidate.resolve()), "sha256": expected})
+    audits = result.get("batch_audits")
+    if not isinstance(audits, list) or not audits:
+        raise ApprovalMismatch("result must bind the per-rank batch audit artifacts")
+    for number, item in enumerate(audits):
+        if not isinstance(item, Mapping):
+            raise ApprovalMismatch("result batch audit artifact is malformed")
+        candidate = Path(str(item.get("path", "")))
+        expected = item.get("sha256")
+        if not candidate.is_file() or not isinstance(expected, str) or sha256_file(candidate) != expected:
+            raise ApprovalMismatch(f"result batch audit artifact does not match: {candidate}")
+        artifacts.append({"role": f"batch_audit:{number}", "path": str(candidate.resolve()), "sha256": expected})
     checkpoint = Path(str(result.get("checkpoint", "")))
     if not checkpoint.is_dir():
         raise ApprovalMismatch(f"required checkpoint artifact is missing: {checkpoint}")
