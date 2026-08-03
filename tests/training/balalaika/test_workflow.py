@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 import voxcpm.training.balalaika.workflow as workflow_module
-from voxcpm.training.balalaika.artifacts import sha256_file
+from voxcpm.training.balalaika.artifacts import fingerprint, sha256_file
 from voxcpm.training.balalaika.config import BalalaikaConfig, DataConfig
 from voxcpm.training.balalaika.index import build_index
 from voxcpm.training.balalaika.selection import create_selection_manifests
@@ -18,7 +18,7 @@ from voxcpm.training.balalaika.workflow import ProductionCommands
 
 @pytest.fixture
 def prepared_deep_audit(synthetic_corpus, tmp_path) -> BalalaikaConfig:
-    identities = [f"{index // 13:06d}/item-{index:02d}.wav" for index in range(25)]
+    identities = [f"{index // 23:06d}/item-{index:02d}.wav" for index in range(45)]
     synthetic_corpus.source_rows = [
         {"source_relative_path": identity, "shard": identity.split("/", maxsplit=1)[0], "include_audio": True}
         for identity in identities
@@ -26,7 +26,7 @@ def prepared_deep_audit(synthetic_corpus, tmp_path) -> BalalaikaConfig:
     synthetic_corpus.rover_rows = [
         {
             "source_relative_path": identity,
-            "asr_agreement_mean": 0.99 if index < 14 else (0.5 if index < 24 else None),
+            "asr_agreement_mean": 0.99 if index < 30 else (0.5 if index < 44 else None),
         }
         for index, identity in enumerate(identities)
     ]
@@ -40,9 +40,9 @@ def prepared_deep_audit(synthetic_corpus, tmp_path) -> BalalaikaConfig:
     synthetic_corpus._refresh_hashes()
     synthetic_corpus.expectations = replace(
         synthetic_corpus.expectations,
-        source_row_count=25,
-        rover_row_count=25,
-        combined_row_count=25,
+        source_row_count=45,
+        rover_row_count=45,
+        combined_row_count=45,
     )
 
     verification = synthetic_corpus.root / "verification.json"
@@ -67,14 +67,14 @@ def prepared_deep_audit(synthetic_corpus, tmp_path) -> BalalaikaConfig:
             encoding="utf-8",
         )
     verification.write_text(
-        json.dumps({"status": "ok", "stats": {"samples": 25}, "shards": shard_rows}), encoding="utf-8"
+        json.dumps({"status": "ok", "stats": {"samples": 45}, "shards": shard_rows}), encoding="utf-8"
     )
     combined_metadata = synthetic_corpus.root / "combined.meta.json"
     combined_metadata.write_text(
         json.dumps(
             {
                 "complete": True,
-                "rows": 25,
+                "rows": 45,
                 "inputs": {
                     "provenance_binding": {
                         "trusted_release": True,
@@ -92,10 +92,10 @@ def prepared_deep_audit(synthetic_corpus, tmp_path) -> BalalaikaConfig:
         verification_manifest=verification,
         combined_metadata=combined_metadata,
         expected_shards=2,
-        expected_rows=25,
+        expected_rows=45,
         expected_null_agreement=1,
-        expected_stage1_rows=10,
-        expected_stage2_rows=14,
+        expected_stage1_rows=14,
+        expected_stage2_rows=30,
     )
     hub_root = tmp_path / "hub"
     benchmark = hub_root / "benchmark" / "data.jsonl"
@@ -163,6 +163,89 @@ def _refresh_declared_index_hash(config: BalalaikaConfig) -> None:
     audit_path.write_text(json.dumps(audit), encoding="utf-8")
 
 
+def _replace_with_self_consistent_noncanonical_selection(config: BalalaikaConfig) -> None:
+    """Replace every chosen row while preserving all old audit invariants."""
+    root = config.selection_dir
+    manifests = {
+        name: json.loads((root / filename).read_text(encoding="utf-8"))
+        for name, filename in (
+            ("memorization", "memorization.json"),
+            ("prompts", "prompts.json"),
+            ("assignments", "benchmark-prompts.json"),
+            ("audio_ids", "audio-log-ids.json"),
+        )
+    }
+    old_memorization = manifests["memorization"]["memorization"]
+    old_prompts = manifests["prompts"]["prompts"]
+    excluded_memorization = {item["source_relative_path"] for item in old_memorization}
+    excluded_prompts = {item["source_relative_path"] for item in old_prompts}
+    index_path = config.data.index_dir / "balalaika-index.sqlite3"
+    with sqlite3.connect(index_path) as database:
+        database.row_factory = sqlite3.Row
+        sidecar_path = Path(database.execute("SELECT value FROM metadata WHERE key = 'sidecar_path'").fetchone()[0])
+        index_fingerprint = database.execute("SELECT value FROM metadata WHERE key = 'fingerprint'").fetchone()[0]
+        memorization_rows = [row for row in database.execute("""
+                SELECT source_relative_path, agreement, stage, sidecar_offset, sidecar_size
+                FROM samples WHERE stage = 2 AND agreement >= 0.95
+                ORDER BY source_relative_path
+                """) if row["source_relative_path"] not in excluded_memorization][:4]
+        prompt_rows = [row for row in database.execute("""
+                SELECT source_relative_path, agreement, stage, sidecar_offset, sidecar_size
+                FROM samples WHERE stage IN (1, 2)
+                ORDER BY source_relative_path
+                """) if row["source_relative_path"] not in excluded_prompts][:20]
+    assert len(memorization_rows) == 4
+    assert len(prompt_rows) == 20
+
+    def replacement(old: dict[str, object], row: sqlite3.Row) -> dict[str, object]:
+        with sidecar_path.open("rb") as source:
+            source.seek(row["sidecar_offset"])
+            sidecar = json.loads(source.read(row["sidecar_size"]))
+        return {
+            **old,
+            "source_relative_path": row["source_relative_path"],
+            "agreement": row["agreement"],
+            "stage": row["stage"],
+            "text": sidecar["rover_punctuated_accented"],
+        }
+
+    memorization = [replacement(old, row) for old, row in zip(old_memorization, memorization_rows, strict=True)]
+    prompts = [replacement(old, row) for old, row in zip(old_prompts, prompt_rows, strict=True)]
+    prompt_ids = [item["prompt_id"] for item in reversed(prompts)]
+    assignment_by_id = {identifier: prompt_ids[identifier % len(prompt_ids)] for identifier in range(2_000)}
+    audio_log_ids = [3, 503, 1_003, 1_503]
+
+    def sample_fingerprint_value(item: dict[str, object]) -> dict[str, object]:
+        value = dict(item)
+        value.pop("wav_path")
+        return value
+
+    replacement_fingerprint = fingerprint(
+        {
+            "schema_version": 1,
+            "seed": config.runtime.seed,
+            "index_fingerprint": index_fingerprint,
+            "memorization": [sample_fingerprint_value(item) for item in memorization],
+            "prompts": [sample_fingerprint_value(item) for item in prompts],
+            "benchmark_prompt_by_id": assignment_by_id,
+            "audio_log_ids": audio_log_ids,
+        }
+    )
+    for manifest in manifests.values():
+        manifest["fingerprint"] = replacement_fingerprint
+    manifests["memorization"]["memorization"] = memorization
+    manifests["prompts"]["prompts"] = prompts
+    manifests["assignments"]["benchmark_prompt_by_id"] = assignment_by_id
+    manifests["audio_ids"]["audio_log_ids"] = audio_log_ids
+    for name, filename in (
+        ("memorization", "memorization.json"),
+        ("prompts", "prompts.json"),
+        ("assignments", "benchmark-prompts.json"),
+        ("audio_ids", "audio-log-ids.json"),
+    ):
+        (root / filename).write_text(json.dumps(manifests[name]), encoding="utf-8")
+
+
 def test_benchmark_loader_accepts_pinned_rows_with_additional_metadata(tmp_path):
     """Catches the production benchmark's descriptive fields being splatted into the scoring dataclass."""
     benchmark = tmp_path / "hard_number_eval.jsonl"
@@ -218,6 +301,16 @@ def test_deep_audit_rejects_selection_content_with_unchanged_declared_fingerprin
     path.write_text(json.dumps(manifest), encoding="utf-8")
 
     with pytest.raises(ValueError, match="selection fingerprint"):
+        commands.audit(prepared_deep_audit)
+
+
+def test_deep_audit_rejects_self_consistent_noncanonical_selection(prepared_deep_audit):
+    """Catches audit accepting a different eligible bundle whose declarations and hashes were rebuilt."""
+    commands = ProductionCommands()
+    assert commands.audit(prepared_deep_audit).values["status"] == "complete"
+    _replace_with_self_consistent_noncanonical_selection(prepared_deep_audit)
+
+    with pytest.raises(ValueError, match="canonical deterministic selection"):
         commands.audit(prepared_deep_audit)
 
 

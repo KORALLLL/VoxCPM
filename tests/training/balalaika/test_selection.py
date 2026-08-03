@@ -14,7 +14,13 @@ import pytest
 
 from voxcpm.training.balalaika.artifacts import sha256_file
 from voxcpm.training.balalaika import selection as selection_module
-from voxcpm.training.balalaika.selection import SelectionError, create_selection_manifests
+from voxcpm.training.balalaika.selection import (
+    SelectionCandidate,
+    SelectionError,
+    build_deterministic_selection_plan,
+    create_selection_manifests,
+    regenerate_selection_bundle,
+)
 
 
 def _wav_bytes() -> bytes:
@@ -68,7 +74,9 @@ def _write_selection_fixture(tmp_path: Path, *, row_count: int = 24) -> Selectio
                         "rover_punctuated_accented": text_by_identity[identity],
                         "speaker_id": None,
                         "is_single_speaker": None,
-                    }, ensure_ascii=False).encode("utf-8")
+                    },
+                    ensure_ascii=False,
+                ).encode("utf-8")
                 + b"\n"
             )
             member = archive.getmember(identity)
@@ -102,15 +110,19 @@ def _write_selection_fixture(tmp_path: Path, *, row_count: int = 24) -> Selectio
                 sidecar_offset, sidecar_size, agreement, stage, speaker_id, is_single_speaker
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)
             """,
-            [(identity, str(tar_path), audio_offset, audio_size, sidecar_offset, sidecar_size, agreement, stage)
-             for identity, agreement, stage, audio_offset, audio_size, sidecar_offset, sidecar_size in rows],
+            [
+                (identity, str(tar_path), audio_offset, audio_size, sidecar_offset, sidecar_size, agreement, stage)
+                for identity, agreement, stage, audio_offset, audio_size, sidecar_offset, sidecar_size in rows
+            ],
         )
         database.execute("INSERT INTO metadata VALUES ('sidecar_path', ?)", (str(sidecar_path),))
         database.execute("INSERT INTO metadata VALUES ('fingerprint', 'synthetic-index')")
 
     benchmark_path = tmp_path / "benchmark.jsonl"
     benchmark_path.write_text(
-        "".join(json.dumps({"id": identifier, "stressed": f"число {identifier}"}) + "\n" for identifier in range(2_000)),
+        "".join(
+            json.dumps({"id": identifier, "stressed": f"число {identifier}"}) + "\n" for identifier in range(2_000)
+        ),
         encoding="utf-8",
     )
     return SelectionFixture(index_path, benchmark_path, tmp_path / "selection-artifacts", text_by_identity)
@@ -133,6 +145,46 @@ def test_selections_are_fixed_and_sample_without_replacement(selection_fixture):
     assert {item.stage for item in first.prompts} == {1, 2}
     assert len(first.benchmark_prompt_by_id) == 2_000
     assert set(first.benchmark_prompt_by_id.values()) <= {item.prompt_id for item in first.prompts}
+
+
+def test_pure_selection_plan_preserves_independent_reservoirs_and_rng_continuation():
+    """Catches publication and audit drifting to different RNG streams or overlap rules."""
+    candidates = [
+        SelectionCandidate(
+            source_relative_path=f"000000/sample-{number:03d}.wav",
+            source_tar_path=Path("unused.tar"),
+            audio_offset=number,
+            audio_size=1,
+            sidecar_offset=number,
+            sidecar_size=1,
+            agreement=0.95 if number >= 12 else 0.94,
+            stage=2 if number >= 12 else 1,
+        )
+        for number in range(24)
+    ]
+
+    first = build_deterministic_selection_plan(iter(candidates[12:]), iter(candidates), range(2_000), seed=29)
+    second = build_deterministic_selection_plan(iter(candidates[12:]), iter(candidates), range(2_000), seed=29)
+
+    assert first == second
+    assert len({row.source_relative_path for row in first.memorization}) == 4
+    assert len({row.source_relative_path for row in first.prompts}) == 20
+    assert {row.source_relative_path for row in first.memorization} & {
+        row.source_relative_path for row in first.prompts
+    }
+    assert len(first.benchmark_prompt_by_id) == 2_000
+    assert len(set(first.audio_log_ids)) == 4
+
+
+def test_regenerated_bundle_does_not_read_published_manifests(selection_fixture):
+    """Catches verifier regeneration using the published bundle as its selection input."""
+    published = create_selection_manifests(**selection_fixture.kwargs, seed=29)
+    for manifest in selection_fixture.output_dir.glob("*.json"):
+        manifest.unlink()
+
+    regenerated = regenerate_selection_bundle(**selection_fixture.kwargs, seed=29)
+
+    assert regenerated == published
 
 
 def test_selection_stores_matching_text_and_extracted_wav_hashes(selection_fixture):
@@ -199,10 +251,7 @@ def _published_files(output_dir: Path) -> dict[str, str]:
 
 
 def _assert_complete_published_bundle(output_dir: Path) -> None:
-    manifests = {
-        path.name: json.loads(path.read_text(encoding="utf-8"))
-        for path in output_dir.glob("*.json")
-    }
+    manifests = {path.name: json.loads(path.read_text(encoding="utf-8")) for path in output_dir.glob("*.json")}
     assert set(manifests) == {"memorization.json", "prompts.json", "benchmark-prompts.json", "audio-log-ids.json"}
     assert len({payload["fingerprint"] for payload in manifests.values()}) == 1
     for kind in ("memorization", "prompts"):

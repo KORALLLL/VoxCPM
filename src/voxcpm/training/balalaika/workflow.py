@@ -28,7 +28,13 @@ from .ledger import ValidationLedger
 from .memorization import approve_memorization, run_memorization, verify_approval
 from .metrics import BenchmarkRow
 from .runtime import AccelerateRuntime
-from .selection import PromptSample, SelectedSample, SelectionBundle, create_selection_manifests
+from .selection import (
+    PromptSample,
+    SelectedSample,
+    SelectionBundle,
+    create_selection_manifests,
+    regenerate_selection_bundle,
+)
 from .tracking import create_run_manager
 from .trainer import BalalaikaTrainer, EvaluationBoundary
 
@@ -801,6 +807,14 @@ def _deep_audit_selection(config: BalalaikaConfig, index_path: Path, index_finge
             combined_path,
             root / "audio" / "prompts" / f"prompt-{number:02d}.wav",
         )
+    expected_bundle = regenerate_selection_bundle(
+        index_path=index_path,
+        benchmark_path=config.hub.local_dir / "benchmark" / config.hub.benchmark_file,
+        output_dir=root,
+        seed=config.runtime.seed,
+    )
+    if expected_bundle.model_dump(mode="json") != bundle.model_dump(mode="json"):
+        raise ValueError("published bundle does not match the canonical deterministic selection")
     return {
         "selection_fingerprint": recomputed_fingerprint,
         "memorization_samples": len(bundle.memorization),

@@ -21,7 +21,6 @@ import torchaudio
 from .artifacts import atomic_json, fingerprint, sha256_file
 from .index import IndexIntegrityError, normalize_identity
 
-
 _MEMORIZATION_COUNT = 4
 _PROMPT_COUNT = 20
 _BENCHMARK_COUNT = 2_000
@@ -66,7 +65,9 @@ class SelectionBundle(BaseModel):
 
 
 @dataclass(frozen=True)
-class _IndexedSample:
+class SelectionCandidate:
+    """Authoritative indexed row supplied to deterministic selection."""
+
     source_relative_path: str
     source_tar_path: Path
     audio_offset: int
@@ -75,6 +76,53 @@ class _IndexedSample:
     sidecar_size: int
     agreement: float
     stage: int
+
+
+@dataclass(frozen=True)
+class DeterministicSelectionPlan:
+    """Pure seed-derived choices shared by publication and verification."""
+
+    memorization: tuple[SelectionCandidate, ...]
+    prompts: tuple[SelectionCandidate, ...]
+    benchmark_prompt_by_id: tuple[tuple[int, str], ...]
+    audio_log_ids: tuple[int, ...]
+
+
+def build_deterministic_selection_plan(
+    memorization_rows: Iterator[SelectionCandidate],
+    prompt_rows: Iterator[SelectionCandidate],
+    benchmark_ids: Sequence[int],
+    seed: int,
+) -> DeterministicSelectionPlan:
+    """Choose the complete canonical bundle without reading or writing manifests."""
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise SelectionError("seed must be an integer")
+    canonical_benchmark_ids = sorted(benchmark_ids)
+    if (
+        len(canonical_benchmark_ids) != _BENCHMARK_COUNT
+        or len(set(canonical_benchmark_ids)) != _BENCHMARK_COUNT
+        or any(
+            isinstance(identifier, bool) or not isinstance(identifier, int) for identifier in canonical_benchmark_ids
+        )
+    ):
+        raise SelectionError("benchmark must contain exactly 2000 unique integer IDs")
+    memorization = _reservoir(
+        memorization_rows,
+        _MEMORIZATION_COUNT,
+        random.Random(seed),
+        "stage-2 memorization",
+    )
+    validation_rng = random.Random(_derived_seed(seed, "validation-prompts"))
+    prompts = _reservoir(prompt_rows, _PROMPT_COUNT, validation_rng, "usable prompt")
+    prompt_ids = [f"prompt-{number:02d}" for number in range(_PROMPT_COUNT)]
+    assignments = tuple((benchmark_id, validation_rng.choice(prompt_ids)) for benchmark_id in canonical_benchmark_ids)
+    audio_log_ids = tuple(sorted(validation_rng.sample(canonical_benchmark_ids, _AUDIO_LOG_COUNT)))
+    return DeterministicSelectionPlan(
+        memorization=tuple(memorization),
+        prompts=tuple(prompts),
+        benchmark_prompt_by_id=assignments,
+        audio_log_ids=audio_log_ids,
+    )
 
 
 def create_selection_manifests(
@@ -105,12 +153,11 @@ def create_selection_manifests(
         try:
             sidecar_path = _sidecar_path(database)
             index_fingerprint = _metadata_value(database, "fingerprint")
-            memorization_rows = _reservoir(
-                _iter_samples(database, stage=2), _MEMORIZATION_COUNT, random.Random(seed), "stage-2 memorization"
-            )
-            validation_rng = random.Random(_derived_seed(seed, "validation-prompts"))
-            prompt_rows = _reservoir(
-                _iter_samples(database, stage=None), _PROMPT_COUNT, validation_rng, "usable prompt"
+            plan = build_deterministic_selection_plan(
+                _iter_samples(database, stage=2),
+                _iter_samples(database, stage=None),
+                _load_benchmark_ids(benchmark_path),
+                seed,
             )
         finally:
             database.close()
@@ -124,7 +171,7 @@ def create_selection_manifests(
                     output_dir / "audio" / "memorization" / f"item-{number:02d}.wav",
                     staging_dir / "audio" / "memorization" / f"item-{number:02d}.wav",
                 )
-                for number, row in enumerate(memorization_rows)
+                for number, row in enumerate(plan.memorization)
             ]
             prompts = [
                 PromptSample(
@@ -136,31 +183,15 @@ def create_selection_manifests(
                         staging_dir / "audio" / "prompts" / f"prompt-{number:02d}.wav",
                     ).model_dump(),
                 )
-                for number, row in enumerate(prompt_rows)
+                for number, row in enumerate(plan.prompts)
             ]
-            benchmark_ids = _load_benchmark_ids(benchmark_path)
-            prompt_ids = [prompt.prompt_id for prompt in prompts]
-            assignments = {benchmark_id: validation_rng.choice(prompt_ids) for benchmark_id in benchmark_ids}
-            audio_log_ids = sorted(validation_rng.sample(benchmark_ids, _AUDIO_LOG_COUNT))
-
-            selection_fingerprint = fingerprint(
-                {
-                    "schema_version": _SCHEMA_VERSION,
-                    "seed": seed,
-                    "index_fingerprint": index_fingerprint,
-                    "memorization": [_sample_fingerprint_value(item) for item in memorization],
-                    "prompts": [_sample_fingerprint_value(item) for item in prompts],
-                    "benchmark_prompt_by_id": assignments,
-                    "audio_log_ids": audio_log_ids,
-                }
-            )
-            bundle = SelectionBundle(
-                fingerprint=selection_fingerprint,
+            bundle = _build_bundle(
+                index_fingerprint=index_fingerprint,
                 seed=seed,
                 memorization=memorization,
                 prompts=prompts,
-                benchmark_prompt_by_id=assignments,
-                audio_log_ids=audio_log_ids,
+                assignments=dict(plan.benchmark_prompt_by_id),
+                audio_log_ids=list(plan.audio_log_ids),
             )
             _write_staged_manifests(staging_dir, bundle)
             _validate_staged_bundle(staging_dir, output_dir, bundle)
@@ -171,6 +202,61 @@ def create_selection_manifests(
         else:
             shutil.rmtree(staging_dir)
             return bundle
+
+
+def regenerate_selection_bundle(
+    index_path: str | Path,
+    benchmark_path: str | Path,
+    output_dir: str | Path,
+    seed: int,
+) -> SelectionBundle:
+    """Regenerate the expected bundle from authoritative inputs without mutation."""
+    index_path = Path(index_path).resolve()
+    benchmark_path = Path(benchmark_path).resolve()
+    output_dir = Path(output_dir).resolve()
+    if not index_path.is_file():
+        raise FileNotFoundError(index_path)
+    if not benchmark_path.is_file():
+        raise FileNotFoundError(benchmark_path)
+    database = _open_index(index_path)
+    try:
+        sidecar_path = _sidecar_path(database)
+        index_fingerprint = _metadata_value(database, "fingerprint")
+        plan = build_deterministic_selection_plan(
+            _iter_samples(database, stage=2),
+            _iter_samples(database, stage=None),
+            _load_benchmark_ids(benchmark_path),
+            seed,
+        )
+    finally:
+        database.close()
+    memorization = [
+        _read_published_sample(
+            row,
+            sidecar_path,
+            output_dir / "audio" / "memorization" / f"item-{number:02d}.wav",
+        )
+        for number, row in enumerate(plan.memorization)
+    ]
+    prompts = [
+        PromptSample(
+            prompt_id=f"prompt-{number:02d}",
+            **_read_published_sample(
+                row,
+                sidecar_path,
+                output_dir / "audio" / "prompts" / f"prompt-{number:02d}.wav",
+            ).model_dump(),
+        )
+        for number, row in enumerate(plan.prompts)
+    ]
+    return _build_bundle(
+        index_fingerprint=index_fingerprint,
+        seed=seed,
+        memorization=memorization,
+        prompts=prompts,
+        assignments=dict(plan.benchmark_prompt_by_id),
+        audio_log_ids=list(plan.audio_log_ids),
+    )
 
 
 def _open_index(path: Path) -> sqlite3.Connection:
@@ -200,18 +286,16 @@ def _sidecar_path(database: sqlite3.Connection) -> Path:
     return path
 
 
-def _iter_samples(database: sqlite3.Connection, *, stage: int | None) -> Iterator[_IndexedSample]:
+def _iter_samples(database: sqlite3.Connection, *, stage: int | None) -> Iterator[SelectionCandidate]:
     where = "stage = 2 AND agreement >= 0.95" if stage == 2 else "stage IN (1, 2)"
     try:
-        cursor = database.execute(
-            f"""
+        cursor = database.execute(f"""
             SELECT source_relative_path, source_tar_path, audio_offset, audio_size,
                    sidecar_offset, sidecar_size, agreement, stage
             FROM samples
             WHERE {where} AND audio_size > 0 AND sidecar_size > 0
             ORDER BY source_relative_path
-            """
-        )
+            """)
         for row in cursor:
             agreement = row["agreement"]
             selected_stage = row["stage"]
@@ -222,7 +306,7 @@ def _iter_samples(database: sqlite3.Connection, *, stage: int | None) -> Iterato
                 or selected_stage not in (1, 2)
             ):
                 raise SelectionError("selection index has an invalid stage or agreement")
-            yield _IndexedSample(
+            yield SelectionCandidate(
                 source_relative_path=str(row["source_relative_path"]),
                 source_tar_path=Path(str(row["source_tar_path"])),
                 audio_offset=int(row["audio_offset"]),
@@ -255,7 +339,12 @@ def _reservoir(rows: Iterator[_Sample], size: int, rng: random.Random, label: st
     return sorted(reservoir, key=lambda row: getattr(row, "source_relative_path"))
 
 
-def _materialize(row: _IndexedSample, sidecar_path: Path, wav_path: Path, staging_wav_path: Path) -> SelectedSample:
+def _materialize(
+    row: SelectionCandidate,
+    sidecar_path: Path,
+    wav_path: Path,
+    staging_wav_path: Path,
+) -> SelectedSample:
     text = _read_indexed_text(sidecar_path, row)
     audio = _read_range(row.source_tar_path, row.audio_offset, row.audio_size, "audio")
     _write_decoded_wav(audio, staging_wav_path)
@@ -269,7 +358,20 @@ def _materialize(row: _IndexedSample, sidecar_path: Path, wav_path: Path, stagin
     )
 
 
-def _read_indexed_text(sidecar_path: Path, row: _IndexedSample) -> str:
+def _read_published_sample(row: SelectionCandidate, sidecar_path: Path, wav_path: Path) -> SelectedSample:
+    if not wav_path.is_file():
+        raise SelectionError(f"canonical selected WAV is unavailable: {wav_path}")
+    return SelectedSample(
+        source_relative_path=row.source_relative_path,
+        agreement=row.agreement,
+        stage=row.stage,
+        text=_read_indexed_text(sidecar_path, row),
+        wav_path=wav_path,
+        wav_sha256=sha256_file(wav_path),
+    )
+
+
+def _read_indexed_text(sidecar_path: Path, row: SelectionCandidate) -> str:
     payload = _read_range(sidecar_path, row.sidecar_offset, row.sidecar_size, "sidecar")
     try:
         value = json.loads(payload.decode("utf-8"))
@@ -317,7 +419,9 @@ def _write_decoded_wav(payload: bytes, destination: Path) -> None:
     temporary_path: Path | None = None
     try:
         waveform, sample_rate = torchaudio.load(io.BytesIO(payload))
-        with NamedTemporaryFile(dir=destination.parent, prefix=f".{destination.stem}.", suffix=".wav", delete=False) as temp:
+        with NamedTemporaryFile(
+            dir=destination.parent, prefix=f".{destination.stem}.", suffix=".wav", delete=False
+        ) as temp:
             temporary_path = Path(temp.name)
         torchaudio.save(temporary_path, waveform, sample_rate, format="wav")
         os.replace(temporary_path, destination)
@@ -364,13 +468,45 @@ def _sample_fingerprint_value(sample: SelectedSample) -> dict[str, object]:
     return value
 
 
+def _build_bundle(
+    *,
+    index_fingerprint: str,
+    seed: int,
+    memorization: list[SelectedSample],
+    prompts: list[PromptSample],
+    assignments: dict[int, str],
+    audio_log_ids: list[int],
+) -> SelectionBundle:
+    selection_fingerprint = fingerprint(
+        {
+            "schema_version": _SCHEMA_VERSION,
+            "seed": seed,
+            "index_fingerprint": index_fingerprint,
+            "memorization": [_sample_fingerprint_value(item) for item in memorization],
+            "prompts": [_sample_fingerprint_value(item) for item in prompts],
+            "benchmark_prompt_by_id": assignments,
+            "audio_log_ids": audio_log_ids,
+        }
+    )
+    return SelectionBundle(
+        fingerprint=selection_fingerprint,
+        seed=seed,
+        memorization=memorization,
+        prompts=prompts,
+        benchmark_prompt_by_id=assignments,
+        audio_log_ids=audio_log_ids,
+    )
+
+
 def _write_staged_manifests(staging_dir: Path, bundle: SelectionBundle) -> None:
     common = {"schema_version": _SCHEMA_VERSION, "fingerprint": bundle.fingerprint, "seed": bundle.seed}
     atomic_json(
         staging_dir / "memorization.json",
         {**common, "memorization": [item.model_dump(mode="json") for item in bundle.memorization]},
     )
-    atomic_json(staging_dir / "prompts.json", {**common, "prompts": [item.model_dump(mode="json") for item in bundle.prompts]})
+    atomic_json(
+        staging_dir / "prompts.json", {**common, "prompts": [item.model_dump(mode="json") for item in bundle.prompts]}
+    )
     atomic_json(
         staging_dir / "benchmark-prompts.json",
         {**common, "benchmark_prompt_by_id": bundle.benchmark_prompt_by_id},
@@ -408,7 +544,9 @@ def _validate_staged_bundle(staging_dir: Path, output_dir: Path, bundle: Selecti
         for value in manifests.values()
     ):
         raise SelectionError("staged selection manifests do not share a fingerprint")
-    if manifests["memorization.json"].get("memorization") != [item.model_dump(mode="json") for item in bundle.memorization]:
+    if manifests["memorization.json"].get("memorization") != [
+        item.model_dump(mode="json") for item in bundle.memorization
+    ]:
         raise SelectionError("staged memorization manifest does not match selected samples")
     if manifests["prompts.json"].get("prompts") != [item.model_dump(mode="json") for item in bundle.prompts]:
         raise SelectionError("staged prompts manifest does not match selected samples")
