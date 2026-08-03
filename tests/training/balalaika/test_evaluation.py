@@ -604,3 +604,49 @@ def test_resume_retention_failure_crosses_the_same_barrier_and_reaches_every_ran
     status = json.loads((completed.ledger.root / "resume-retention-status.json").read_text(encoding="utf-8"))
     assert status["status"] == "failed"
     assert status["error"]["type"] == "EvaluationIntegrityError"
+
+
+def test_resume_status_write_failure_is_gathered_before_any_rank_enters_barrier(tmp_path: Path, monkeypatch) -> None:
+    """Catches rank zero leaving on status publication while a resume worker waits at the barrier."""
+    completed = _fixture(tmp_path)
+    completed.evaluator.run(completed.model, completed.vae, completed.checkpoint, completed.boundary)
+
+    class CoordinatedFailureRuntime(FakeRuntime):
+        def gather(self, value):
+            self.gather_calls += 1
+            return torch.tensor([0, 1], dtype=value.dtype, device=value.device)
+
+    main_runtime = CoordinatedFailureRuntime(rank=0, world_size=2)
+    worker_runtime = CoordinatedFailureRuntime(rank=1, world_size=2)
+    completed.evaluator.runtime = main_runtime
+    worker = DistributedEvaluator(
+        runtime=worker_runtime,
+        rows=completed.rows,
+        selection=completed.selection,
+        ledger=completed.ledger,
+        asr_factory=lambda _device_id: FakeASR(completed.events),
+        run_manager=FakeRunManager(completed.events),
+        expected_item_count=4,
+        validation_root=tmp_path,
+        payload_factory=_fake_payload,
+        generation_settings={"cfg_value": 3.5, "inference_timesteps": 17, "max_length": 777},
+    )
+    real_atomic_json = evaluation_module.atomic_json
+
+    def fail_resume_status(path: Path, value: dict[str, object]) -> None:
+        if Path(path).name == "resume-retention-status.json":
+            raise OSError("injected resume status write failure")
+        real_atomic_json(path, value)
+
+    monkeypatch.setattr(evaluation_module, "atomic_json", fail_resume_status)
+
+    for evaluator, model, vae in (
+        (completed.evaluator, completed.model, completed.vae),
+        (worker, FakeModel(), FakeVAE()),
+    ):
+        with pytest.raises(RuntimeError, match="resume retention status publication failed"):
+            evaluator.run(model, vae, completed.checkpoint, completed.boundary)
+
+    assert main_runtime.gather_calls == worker_runtime.gather_calls == 1
+    assert main_runtime.barriers == worker_runtime.barriers == 0
+    assert not (completed.ledger.root / "resume-retention-status.json").exists()

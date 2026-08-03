@@ -73,3 +73,37 @@ Protected files before and after audit:
 ## Prohibited-action attestation
 
 This fix wave did **not** run real memorization, create approval, start stage 1 or stage 2 training, publish W&B/model artifacts, run real pin/prepare, expose credentials, or mutate the proprietary corpus/current production generation. Only read-only production audit and synthetic bounded GPU smokes were executed.
+
+## Final residual correction — 2026-08-03
+
+Base: `fa8210a534ce65dcedefb13c503d22ff7fa6bd52`
+
+The scoped re-review's three verified residuals were corrected without addressing optional or minor scope:
+
+1. **NULL ordinal substitution** — the independent ordinal join now rejects `samples.stage IS NULL` explicitly in addition to unequal eligible stages. A self-consistent regression replaces a stage-1 ordinal's sample with the excluded row while preserving ordinal count/range and the refreshed audit hash.
+2. **Resume-status publication** — completed-validation resume retains the rank-zero write error, gathers write outcomes on every rank, and raises collectively before any rank enters the barrier or reads the missing status. The regression executes rank zero and a worker against a shared simulated `[failure, success]` outcome and proves one gather plus zero barriers on both.
+3. **Probe materialization** — representative-ordinal lookup, dataset indexing/decode, and collation now occur inside the protected per-candidate `sample_factory`. The regression injects a local decode failure and proves it becomes a gathered terminal `ProbeError` rather than escaping before the collective.
+
+### Residual TDD evidence
+
+- RED command: focused three-test run → `3 failed` for the exact defects: ordinal substitution did not raise, resume surfaced raw `OSError`, and decode surfaced raw `ValueError` before a gather.
+- GREEN command: identical focused run → `3 passed, 5 warnings in 4.96s`.
+- Final post-format full suite: `rtk proxy uv run pytest tests -q` → `373 passed, 18 warnings in 103.84s`.
+- Changed-file Black check: 4 files unchanged; Flake8 `--max-line-length=120`, compileall, and `git diff --check`: exit 0.
+
+### Residual production and GPU evidence
+
+The required read-only audit exited 0 and reproduced:
+
+- 519 source shards; 4,075,032 joined; 4,074,723 eligible; 309 excluded
+- Stage 1 = 2,486,821; stage 2 = 1,587,902
+- Index bytes = 1,159,962,624
+- Index fingerprint = `b276bdaf32e1ef2ed0275b919625215959e91494ad354caca8f272273f210cf2`
+- Selection fingerprint = `d7ab905d69f33a64c4c747dbf665eef6ed5c313cad6ac12534d9e3036991b629`
+- Audit identity = `7cc1d8d787045937796895e4e824e32fc24e98a40c0e311b3bcf01d6d4d23abf`
+
+Fresh bounded smokes all exited 0: one-rank train/checkpoint, eight-rank train/checkpoint with synchronized LoRA gradients and exact 0–31 sample coverage, and eight-rank/32-item validation with ASR release on every rank plus one aggregate/completion/tracking publication.
+
+Protected files retained identical before/after sizes and nanosecond mtimes: `verification.json` = 80,269 bytes at `2026-07-29 22:14:42.000000000 +0000`; combined sidecar = 1,366,964,556 bytes at `2026-07-31 22:56:02.000000000 +0000`; ROVER archive = 375,137,790 bytes at `2026-07-29 21:58:57.000000000 +0000`.
+
+No real memorization, approval, preparation, stage training, W&B/model publication, credential access, or production/corpus mutation occurred. Previously documented non-blocking concerns remain unchanged; this correction introduces no new known load-bearing residual.

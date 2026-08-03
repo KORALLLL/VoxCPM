@@ -341,6 +341,7 @@ class DistributedEvaluator:
         completion_path = self.ledger.root / "validation-complete.json"
         if completion_path.is_file():
             status_path = self.ledger.root / "resume-retention-status.json"
+            status_write_error: BaseException | None = None
             if self.runtime.rank == 0:
                 try:
                     record = self._verify_completion(context, require_retained=False)
@@ -358,7 +359,18 @@ class DistributedEvaluator:
                         "input_fingerprint": context.input_fingerprint,
                         "error": _error_snapshot(error),
                     }
-                atomic_json(status_path, status)
+                try:
+                    atomic_json(status_path, status)
+                except BaseException as error:
+                    status_write_error = error
+            outcome = torch.tensor(
+                [1 if status_write_error is None else 0], dtype=torch.int8, device=self.runtime.device
+            )
+            outcomes = self.runtime.gather(outcome).reshape(-1)
+            if not bool((outcomes == 1).all().item()):
+                raise RuntimeError(
+                    "resume retention status publication failed on one or more ranks"
+                ) from status_write_error
             self.runtime.barrier()
             status = _read_json(status_path, "resume retention status")
             if status.get("input_fingerprint") != context.input_fingerprint:

@@ -13,6 +13,7 @@ import voxcpm.training.balalaika.workflow as workflow_module
 from voxcpm.training.balalaika.artifacts import fingerprint, sha256_file
 from voxcpm.training.balalaika.config import BalalaikaConfig, DataConfig
 from voxcpm.training.balalaika.index import IndexAudit, build_index
+from voxcpm.training.balalaika.probe import ProbeError
 from voxcpm.training.balalaika.selection import create_selection_manifests
 from voxcpm.training.balalaika.workflow import ProductionCommands
 
@@ -308,6 +309,21 @@ def test_deep_audit_rejects_sqlite_stage_tampering_with_preserved_declarations(p
 
     with pytest.raises(ValueError, match="stage-1 row count"):
         commands.audit(prepared_deep_audit)
+
+
+def test_deep_audit_rejects_excluded_sample_substituted_into_stage_ordinals(prepared_deep_audit):
+    """Catches SQL NULL comparison hiding an excluded sample behind a valid stage ordinal."""
+    index_path = prepared_deep_audit.data.index_dir / "balalaika-index.sqlite3"
+    with sqlite3.connect(index_path) as database:
+        excluded_id = database.execute("SELECT sample_id FROM samples WHERE stage IS NULL").fetchone()[0]
+        database.execute(
+            "UPDATE stage_ordinals SET sample_id = ? WHERE stage = 1 AND ordinal = 0",
+            (excluded_id,),
+        )
+    _refresh_declared_index_hash(prepared_deep_audit)
+
+    with pytest.raises(ValueError, match="stage ordinals"):
+        ProductionCommands().audit(prepared_deep_audit)
 
 
 def test_deep_audit_rejects_selection_content_with_unchanged_declared_fingerprint(prepared_deep_audit):
@@ -805,6 +821,66 @@ def test_production_microbatch_selector_probes_longest_rows_and_honors_fixed_byp
     fixed = config.model_copy(update={"runtime": config.runtime.model_copy(update={"fixed_microbatch": 3})})
     bypass = workflow_module._production_microbatch_selector(fixed, 1)
     assert bypass(Runtime(), model, optimizer, fixed.stage1, object(), lambda _batch: {}) == 3
+
+
+def test_production_microbatch_selector_coordinates_rank_local_materialization_failure(tmp_path, monkeypatch):
+    """Catches a local dataset/decode failure escaping before the probe's all-rank status collective."""
+    index_root = tmp_path / "index"
+    index_root.mkdir()
+    with sqlite3.connect(index_root / "balalaika-index.sqlite3") as database:
+        database.executescript("""
+            CREATE TABLE samples (sample_id INTEGER PRIMARY KEY, source_relative_path TEXT, duration REAL);
+            CREATE TABLE stage_ordinals (stage INTEGER, ordinal INTEGER, sample_id INTEGER);
+            INSERT INTO samples VALUES (1, 'long.wav', 9.0);
+            INSERT INTO stage_ordinals VALUES (1, 0, 1);
+            """)
+    config = BalalaikaConfig.model_validate(
+        {
+            "data": {"corpus_root": tmp_path / "corpus", "index_dir": index_root},
+            "output_dir": tmp_path / "runs",
+            "selection_dir": tmp_path / "selection",
+            "runtime": {"batch_candidates": [1], "accumulation": 1},
+        }
+    )
+    monkeypatch.setattr(workflow_module, "VoxCPMCollator", lambda: lambda rows: rows)
+
+    class Runtime:
+        device = torch.device("cpu")
+        gather_calls = 0
+
+        @staticmethod
+        def unwrap(model):
+            return model
+
+        @classmethod
+        def gather(cls, value):
+            cls.gather_calls += 1
+            return value
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lora_A = torch.nn.Parameter(torch.tensor(1.0))
+
+    class FailingDataset:
+        def __getitem__(self, _ordinal):
+            raise ValueError("injected decode failure")
+
+    model = Model()
+    selector = workflow_module._production_microbatch_selector(config, 1)
+
+    with pytest.raises(ProbeError, match="non-OOM.*candidate 1") as raised:
+        selector(
+            Runtime(),
+            model,
+            torch.optim.SGD(model.parameters(), lr=0.1),
+            config.stage1,
+            FailingDataset(),
+            lambda batch: batch,
+        )
+
+    assert isinstance(raised.value.__cause__, ValueError)
+    assert Runtime.gather_calls == 1
 
 
 @pytest.mark.parametrize("trainer_fails", [False, True])

@@ -202,3 +202,12 @@
 - Production evidence: Read-only deep audit exited 0 with 519 shards, 4,075,032 joined rows, 4,074,723 eligible rows, 309 exclusions, stage 1 = 2,486,821, stage 2 = 1,587,902, index fingerprint `b276bdaf32e1ef2ed0275b919625215959e91494ad354caca8f272273f210cf2`, selection fingerprint `d7ab905d69f33a64c4c747dbf665eef6ed5c313cad6ac12534d9e3036991b629`, and audit identity `7cc1d8d787045937796895e4e824e32fc24e98a40c0e311b3bcf01d6d4d23abf`.
 - GPU evidence: Fresh one-rank and eight-rank train/checkpoint smokes passed with restored checkpoints and real synchronized LoRA gradients; fresh eight-rank/32-item validation passed with disjoint complete coverage, ASR release on every rank, and one aggregate/completion/tracking publication.
 - Scope: No real memorization, approval, stage training, W&B or model publication, pin/prepare, or proprietary-corpus write occurred. Protected `verification.json`, combined sidecar, and ROVER archive sizes and mtimes exactly matched their pre-audit baseline.
+
+## 2026-08-03 - Final residual correction
+
+- Changed: Ordinal integrity treats an ordinal joined to `samples.stage IS NULL` as a mismatch, closing SQLite's three-valued-comparison gap while retaining the existing exact stage/count/range checks.
+- Changed: Completed-validation resume gathers rank-local status-publication outcomes before any barrier or status read. A rank-zero write failure now makes every rank raise from the same collective phase instead of stranding workers.
+- Changed: Production probe ordinal lookup, dataset decode/materialization, and collation now execute inside `probe_microbatch`'s guarded `sample_factory`, so OOM and terminal failures reach the candidate's all-rank status collective.
+- Validation: The three regressions first failed for the exact old behaviors, then passed together. The final post-format suite passed 373 tests with 18 expected TorchCodec warnings in 103.84 seconds; changed-file Black, Flake8, compileall, and diff checks passed.
+- Validation: Read-only production audit reproduced 519 shards, 4,075,032 joined rows, 4,074,723 eligible rows, 309 exclusions, the 2,486,821/1,587,902 stage split, and unchanged index/selection/audit fingerprints. Fresh one-rank and eight-rank checkpoint smokes plus eight-rank/32-item validation passed.
+- Scope: Protected corpus artifact sizes and nanosecond mtimes were identical before and after. No real pin/prepare, memorization, approval, stage training, W&B/model publication, or proprietary-corpus write was performed.

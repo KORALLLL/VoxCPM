@@ -798,12 +798,11 @@ def _production_microbatch_selector(config: BalalaikaConfig, stage: int) -> Call
                 object(),
                 explicit_microbatch=explicit,
             ).microbatch
-        ordinals = _representative_long_ordinals(config, stage, max(candidates))
-        collator = VoxCPMCollator()
-        samples = [dataset[ordinal] for ordinal in ordinals]
 
         def sample_factory(candidate: int) -> Any:
-            return collator(samples[:candidate])
+            ordinals = _representative_long_ordinals(config, stage, candidate)
+            samples = [dataset[ordinal] for ordinal in ordinals]
+            return VoxCPMCollator()(samples)
 
         step = _ProductionProbeStep(model, optimizer, processor, config.optimization.loss_weights)
         return probe_microbatch(runtime, candidates, sample_factory, step).microbatch
@@ -987,7 +986,7 @@ def _deep_audit_index(
                 SELECT ordinal.stage, ordinal.ordinal
                 FROM stage_ordinals AS ordinal
                 JOIN samples AS sample USING (sample_id)
-                WHERE ordinal.stage != sample.stage
+                WHERE sample.stage IS NULL OR ordinal.stage != sample.stage
                 LIMIT 1
                 """).fetchone()
             ordinal_ranges = {
