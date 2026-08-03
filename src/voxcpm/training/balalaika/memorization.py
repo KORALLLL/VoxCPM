@@ -23,6 +23,7 @@ from voxcpm.training.data import VoxCPMCollator
 from .artifacts import atomic_json, fingerprint, sha256_file
 from .asr import GigaAMRNNT
 from .checkpoint import CheckpointManager
+from .generation import generation_autocast
 from .schedule import EpochGeometry, TrainingProgress
 from .selection import SelectedSample
 from .tracking import create_run_manager, memorization_pair_payload
@@ -305,15 +306,16 @@ def run_memorization(config: Any, runtime: Any) -> MemorizationResult:
             target_model.eval()
             audio_vae.eval()
             for index, sample in enumerate(samples):
-                generated = target_model.generate(
-                    target_text=sample.text,
-                    prompt_text="",
-                    prompt_wav_path="",
-                    seed=settings["seed"] + index,
-                    cfg_value=generation_settings["cfg_value"],
-                    inference_timesteps=generation_settings["inference_timesteps"],
-                    max_len=generation_settings["max_length"],
-                )
+                with generation_autocast(runtime.device):
+                    generated = target_model.generate(
+                        target_text=sample.text,
+                        prompt_text="",
+                        prompt_wav_path="",
+                        seed=settings["seed"] + index,
+                        cfg_value=generation_settings["cfg_value"],
+                        inference_timesteps=generation_settings["inference_timesteps"],
+                        max_len=generation_settings["max_length"],
+                    )
                 generated_path = generated_dir / f"item-{index:02d}.wav"
                 _atomic_wav(generated_path, generated, _sample_rate(target_model))
                 generated_audio.append(generated_path)

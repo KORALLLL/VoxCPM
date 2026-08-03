@@ -314,6 +314,20 @@ class CheckpointManager:
             progress.reset_for_stage("stage2", sampler_seed=sampler_seed)
         return metadata
 
+    def load_verified_adapter(
+        self,
+        model: Any,
+        checkpoint: Path,
+        *,
+        expected: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Verify one checkpoint and load only its LoRA adapter tensors."""
+        self._ensure_usable()
+        checkpoint = Path(checkpoint)
+        metadata = self.verify(checkpoint, expected)
+        self._load_adapter(model, checkpoint / self._ADAPTER_FILE)
+        return metadata
+
     def verify(self, checkpoint: Path, expected: Mapping[str, Any]) -> dict[str, Any]:
         """Verify structure, hashes, metadata fingerprint, adapter keys, and expected identity."""
         checkpoint = Path(checkpoint)

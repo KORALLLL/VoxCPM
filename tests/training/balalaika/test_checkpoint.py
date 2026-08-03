@@ -274,6 +274,41 @@ def test_stage2_load_uses_only_final_stage1_adapter_and_resets_progress(tmp_path
     assert stage2_progress.global_step == 32
 
 
+def test_verified_adapter_load_accepts_recovery_without_restoring_training_state(tmp_path):
+    """Catches the operator probe bypassing recovery integrity or restoring optimizer/RNG state."""
+    source_model = FakeModel()
+    accelerator = FakeAccelerator(source_model)
+    progress = TrainingProgress(
+        stage="stage1",
+        boundary=8,
+        microstep=1_024,
+        optimizer_step=256,
+        global_step=256,
+        sampler_seed=7,
+    )
+    manager = CheckpointManager(tmp_path)
+    checkpoint = manager.save_recovery(
+        accelerator,
+        source_model,
+        progress,
+        checkpoint_metadata(stage_epochs=1, optimizer_steps_per_epoch=256),
+        name="memorization-final",
+    )
+    target_model = FakeModel()
+    target_model.weights["lm.layer.lora_A.weight"] = torch.tensor([-1.0, -1.0])
+
+    metadata = manager.load_verified_adapter(
+        target_model,
+        checkpoint,
+        expected={"checkpoint_kind": "recovery", "stage": "stage1", "optimizer_step": 256},
+    )
+
+    assert target_model.loaded_lora
+    assert not target_model.loaded_optimizer
+    assert target_model.weights["lm.layer.lora_A.weight"].tolist() == [1.0, 2.0]
+    assert metadata["checkpoint_fingerprint"] == manager.verify(checkpoint, {})["checkpoint_fingerprint"]
+
+
 def test_stage_transition_rejects_non_final_or_non_stage1_checkpoint(tmp_path):
     progress = TrainingProgress(stage="stage1", epoch=0, boundary=7, microstep=56, optimizer_step=14, global_step=14)
     manager, path, _, _, _ = save_checkpoint(tmp_path, progress=progress)

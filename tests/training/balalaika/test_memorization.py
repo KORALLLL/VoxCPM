@@ -385,6 +385,40 @@ def test_memorization_generates_without_prompt_and_logs_every_pair(mem_fixture):
     assert not hasattr(mem_fixture.models[0], "audio_vae")
 
 
+def test_memorization_enters_generation_autocast_for_mixed_dtype_linear(mem_fixture, monkeypatch):
+    """Catches unwrapped memorization generation running outside the shared autocast context."""
+    from voxcpm.training.balalaika import memorization as module
+
+    original_builder = module.build_model
+
+    def mixed_dtype_builder(*args, **kwargs):
+        model, audio_vae, tokenizer = original_builder(*args, **kwargs)
+        original_generate = model.generate
+
+        def mixed_dtype_generate(**generation_kwargs):
+            torch.nn.functional.linear(
+                torch.ones((1, 1), dtype=torch.bfloat16),
+                torch.ones((1, 1), dtype=torch.float32),
+            )
+            return original_generate(**generation_kwargs)
+
+        model.generate = mixed_dtype_generate
+        return model, audio_vae, tokenizer
+
+    @contextmanager
+    def cpu_bf16_autocast(device):
+        assert device == mem_fixture.runtime.device
+        with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+            yield
+
+    monkeypatch.setattr(module, "build_model", mixed_dtype_builder)
+    monkeypatch.setattr(module, "generation_autocast", cpu_bf16_autocast, raising=False)
+
+    result = run_memorization(mem_fixture.config, mem_fixture.runtime)
+
+    assert result.status == "complete"
+
+
 def test_gigaam_text_diagnostics_never_gate_result(mem_fixture):
     result = run_memorization(mem_fixture.config, mem_fixture.runtime)
 

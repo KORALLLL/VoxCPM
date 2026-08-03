@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 import json
 from pathlib import Path
@@ -271,6 +272,32 @@ def test_generation_uses_current_prompt_seed_claim_and_restores_model_after_asr(
     assert first["claim_epoch"] == 1
     assert first["asr"]["status"] == "success"
     assert first["asr"]["hypothesis"] == ""
+
+
+def test_evaluation_enters_generation_autocast_for_mixed_dtype_linear(tmp_path: Path, monkeypatch) -> None:
+    """Catches unwrapped validation generation running outside the shared autocast context."""
+    fixture = _fixture(tmp_path)
+    original_generate = fixture.model.generate
+
+    def mixed_dtype_generate(**kwargs):
+        torch.nn.functional.linear(
+            torch.ones((1, 1), dtype=torch.bfloat16),
+            torch.ones((1, 1), dtype=torch.float32),
+        )
+        return original_generate(**kwargs)
+
+    @contextmanager
+    def cpu_bf16_autocast(device):
+        assert device == fixture.runtime.device
+        with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+            yield
+
+    monkeypatch.setattr(fixture.model, "generate", mixed_dtype_generate)
+    monkeypatch.setattr(evaluation_module, "generation_autocast", cpu_bf16_autocast, raising=False)
+
+    completed = fixture.evaluator.run_rank(fixture.model, fixture.vae, fixture.checkpoint, fixture.boundary)
+
+    assert completed == {0, 1, 2, 3}
 
 
 def test_generation_retries_are_bounded_and_reuse_the_deterministic_seed(tmp_path: Path) -> None:

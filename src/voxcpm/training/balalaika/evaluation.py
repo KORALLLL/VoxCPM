@@ -20,6 +20,7 @@ import soundfile as sf
 import torch
 
 from .artifacts import atomic_json, fingerprint, sha256_file
+from .generation import generation_autocast
 from .ledger import ValidationClaim, ValidationLedger
 from .metrics import AggregateScore, BenchmarkRow, ItemScore, aggregate_scores, score_utterance
 from .tracking import ValidationItem, ValidationPayload
@@ -491,15 +492,16 @@ class DistributedEvaluator:
                     break
                 started = time.monotonic()
                 try:
-                    generated = model.generate(
-                        target_text=self._row_by_id[item_id].stressed,
-                        prompt_text=str(inputs["prompt_text"]),
-                        prompt_wav_path=str(inputs["prompt_wav_path"]),
-                        seed=seed,
-                        cfg_value=self.generation_settings["cfg_value"],
-                        inference_timesteps=self.generation_settings["inference_timesteps"],
-                        max_len=self.generation_settings["max_length"],
-                    )
+                    with generation_autocast(self.runtime.device):
+                        generated = model.generate(
+                            target_text=self._row_by_id[item_id].stressed,
+                            prompt_text=str(inputs["prompt_text"]),
+                            prompt_wav_path=str(inputs["prompt_wav_path"]),
+                            seed=seed,
+                            cfg_value=self.generation_settings["cfg_value"],
+                            inference_timesteps=self.generation_settings["inference_timesteps"],
+                            max_len=self.generation_settings["max_length"],
+                        )
                     wav_path = self.ledger.wav_path(item_id, rank=self.runtime.rank)
                     _atomic_wav(wav_path, generated, _sample_rate(model))
                     self.ledger.record_generation(
