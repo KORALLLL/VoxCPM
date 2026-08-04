@@ -254,3 +254,4 @@
 - Root cause: Memorization's private atomic WAV writer called `.cpu().numpy()` directly on the BF16 tensor returned by low-level generation. Evaluation and the production probe already converted tensors to float32 before NumPy, so the failure was isolated to this duplicate conversion boundary.
 - Fix: Memorization now performs `detach().float().cpu().numpy()` before its existing float32 waveform validation and atomic PCM-16 write.
 - TDD: The focused regression first failed with the exact production exception on a real BF16 tensor, then the complete memorization suite passed 37 tests. The full project suite passes 384 tests with 19 expected warnings; changed-file Black, Flake8, and `git diff --check` pass.
+- Recovery: The failed run and its valid 256-update adapter were moved intact to `/workspace/balalaika_lora_training/runs/memorization-failed-ef9459f0c9a64a8d90f9d4a47c4916db`; the canonical memorization directory is clear for the post-fix retry.
