@@ -255,3 +255,9 @@
 - Fix: Memorization now performs `detach().float().cpu().numpy()` before its existing float32 waveform validation and atomic PCM-16 write.
 - TDD: The focused regression first failed with the exact production exception on a real BF16 tensor, then the complete memorization suite passed 37 tests. The full project suite passes 384 tests with 19 expected warnings; changed-file Black, Flake8, and `git diff --check` pass.
 - Recovery: The failed run and its valid 256-update adapter were moved intact to `/workspace/balalaika_lora_training/runs/memorization-failed-ef9459f0c9a64a8d90f9d4a47c4916db`; the canonical memorization directory is clear for the post-fix retry.
+
+## 2026-08-04 - Failed-run artifact cleanup
+
+- At the user's request, permanently deleted all three local failed memorization archives (`e6baf4d439df40d188e5d6b5e85375c4`, `1c0d9e5d5a6442619166a00293acc670`, and `ef9459f0c9a64a8d90f9d4a47c4916db`) and their matching local W&B caches/stale symlinks, reclaiming approximately 661 MB. The earlier recovery/archive notes above are historical; those local checkpoints and probe WAVs are no longer recoverable.
+- Preserved: remote W&B run history, proprietary corpus, generated index/selection, immutable Hub pins, source worktree, and unrelated Qwen artifacts. The VoxCPM `runs` directory now contains only the zero-byte pipeline-owned `.prepare.lock`; the local W&B directory is empty.
+- Operation: The post-fix memorization launch was paused before it started so cleanup could not race with output creation. One unrelated Qwen preparation process still holds 500 MB on GPU 0; the clean retry remains next after that process exits.
