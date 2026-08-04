@@ -15,6 +15,7 @@ from voxcpm.training.balalaika.artifacts import fingerprint, sha256_file
 from voxcpm.training.balalaika.memorization import (
     ApprovalMismatch,
     MemorizationError,
+    _atomic_wav,
     approve_memorization,
     run_memorization,
     verify_approval,
@@ -417,6 +418,18 @@ def test_memorization_enters_generation_autocast_for_mixed_dtype_linear(mem_fixt
     result = run_memorization(mem_fixture.config, mem_fixture.runtime)
 
     assert result.status == "complete"
+
+
+def test_memorization_writes_bfloat16_generated_tensor(tmp_path):
+    """Catches generated BF16 audio reaching NumPy without a float32 conversion."""
+    output = tmp_path / "generated.wav"
+
+    _atomic_wav(output, torch.linspace(-0.5, 0.5, 160, dtype=torch.bfloat16), 16_000)
+
+    with wave.open(str(output), "rb") as reader:
+        assert reader.getnchannels() == 1
+        assert reader.getframerate() == 16_000
+        assert reader.getnframes() == 160
 
 
 def test_gigaam_text_diagnostics_never_gate_result(mem_fixture):

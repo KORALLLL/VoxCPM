@@ -944,7 +944,7 @@ def _validate_wandb_evidence(result: Mapping[str, Any], completion: Mapping[str,
 
 def _atomic_wav(path: Path, generated: Any, sample_rate: int) -> None:
     if isinstance(generated, torch.Tensor):
-        generated = generated.detach().cpu().numpy()
+        generated = generated.detach().float().cpu().numpy()
     waveform = np.asarray(generated, dtype=np.float32).squeeze()
     if waveform.ndim != 1 or waveform.size == 0 or sample_rate <= 0:
         raise MemorizationError("generated audio must be a non-empty mono waveform")
